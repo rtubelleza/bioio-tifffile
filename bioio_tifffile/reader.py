@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
+
 import logging
 import typing
 import warnings
@@ -15,6 +16,12 @@ from fsspec.spec import AbstractFileSystem
 from tifffile import TiffFile, imread
 from tifffile.tifffile import TiffTags
 
+from .qptiff_metadata import (
+    QptiffMetadata,
+    extract_datetime_from_page,
+    extract_qpi_xml_from_page,
+    parse_qpi_xml,
+)
 from .utils import generate_ome_channel_id, generate_ome_image_id
 
 ###############################################################################
@@ -23,6 +30,8 @@ from .utils import generate_ome_channel_id, generate_ome_image_id
 # "I" is used to mean a generic image sequence
 UNKNOWN_DIM_CHARS = ["Q", "I"]
 TIFF_IMAGE_DESCRIPTION_TAG_INDEX = 270
+
+FULL_RESOLUTION_TYPE = "FullResolution" # qptiff
 
 log = logging.getLogger(__name__)
 
@@ -62,6 +71,10 @@ class Reader(reader.Reader):
     _scenes: typing.Optional[typing.Tuple[str, ...]] = None
     _physical_pixel_sizes: typing.Optional[types.PhysicalPixelSizes] = None
 
+    # qptiff
+    _scene_series_map: typing.Optional[typing.Dict[int, int]] = None # qptiffs hold multiple tiff images, where series elements are thumbnails, labels, overview, etc.
+    _qpi_meta_cache: typing.Dict[int, QptiffMetadata] # parsed XML fields of each tiff image series above. keys match above mapping
+    
     @staticmethod
     def _is_supported_image(
         fs: AbstractFileSystem, path: str, **kwargs: typing.Any
@@ -99,7 +112,6 @@ class Reader(reader.Reader):
                 "available plugins."
             )
 
-        # Expand details of provided image
         self._fs, self._path = io.pathlike_to_fs(
             image,
             enforce_exists=True,
@@ -119,6 +131,7 @@ class Reader(reader.Reader):
                     f"Number of scenes: {len(self.scenes)}, "
                     f"Number of provided dimension order strings: {len(dim_order)}"
                 )
+        
         # If provided a list
         if isinstance(channel_names, list):
             # If provided a list of lists
@@ -136,6 +149,13 @@ class Reader(reader.Reader):
         self._dim_order = dim_order
         self._channel_names = channel_names
 
+        # qptiff
+        if "include_aux_series" in kwargs:
+            self._include_aux_series = kwargs["include_aux_series"]
+        else:
+            self._include_aux_series = False
+        self._qpi_meta_cache = {}
+
         # Enforce valid image
         self._is_supported_image(self._fs, self._path)
 
@@ -144,31 +164,35 @@ class Reader(reader.Reader):
         if self._scenes is None:
             with self._fs.open(self._path) as open_resource:
                 with TiffFile(open_resource, is_mmstack=False) as tiff:
-                    # This is non-metadata tiff, just use available series indices
-                    self._scenes = tuple(
-                        generate_ome_image_id(i) for i in range(len(tiff.series))
-                    )
-
+                    self._scenes, self._scene_series_map = self._build_scene_map(tiff)
         return self._scenes
 
     @property
     def physical_pixel_sizes(self) -> types.PhysicalPixelSizes:
-        """Return the physical pixel sizes of the image."""
+        """
+        Physical pixel sizes in micrometres (Z, Y, X).
+
+        Prefers PixelSizeMicrons from the QPI XML; falls back to TIFF
+        XResolution / YResolution tags.
+        """
         if self._physical_pixel_sizes is None:
-            with self._fs.open(self._path) as open_resource:
-                try:
-                    z_size, y_size, x_size = _get_pixel_size(
-                        open_resource, self._current_scene_index
-                    )
-                except Exception as e:
-                    warnings.warn(f"Could not parse tiff pixel size: {e}")
-                    z_size, y_size, x_size = None, None, None
-
-            self._physical_pixel_sizes = types.PhysicalPixelSizes(
-                z_size, y_size, x_size
-            )
+            tiff_series_idx = self._tiff_series_index(self.current_scene_index)
+            meta = self.qpi_metadata
+            if meta.pixel_size_um is not None:
+                px = meta.pixel_size_um
+                self._physical_pixel_sizes = types.PhysicalPixelSizes(None, px, px)
+            else:
+                with self._fs.open(self._path) as open_resource:
+                    try:
+                        z, y, x = _get_pixel_size(
+                            open_resource, tiff_series_idx
+                        )
+                    except Exception as exc:
+                        warnings.warn(f"Could not parse QPTIFF pixel size: {exc}")
+                        z, y, x = None, None, None
+                self._physical_pixel_sizes = types.PhysicalPixelSizes(z, y, x)
         return self._physical_pixel_sizes
-
+    
     @staticmethod
     def _get_image_data(
         fs: AbstractFileSystem,
@@ -216,17 +240,14 @@ class Reader(reader.Reader):
                 # handoff _during_ a read.
                 return arr[retrieve_indices].compute(scheduler="synchronous")
 
-    def _get_tiff_tags(self, tiff: TiffFile, process: bool = True) -> TiffTags:
-        unprocessed_tags = tiff.series[self.current_scene_index].pages[0].tags
+    def _get_tiff_tags(
+        self, tiff: TiffFile, process: bool = True
+    ) -> typing.Union[TiffTags, typing.Dict[int, typing.Any]]:
+        tiff_series_idx = self._tiff_series_index(self.current_scene_index)
+        unprocessed = tiff.series[tiff_series_idx].pages[0].tags
         if not process:
-            return unprocessed_tags
-
-        # Create dict of tag and value
-        tags: typing.Dict[int, str] = {}
-        for code, tag in unprocessed_tags.items():
-            tags[code] = tag.value
-
-        return tags
+            return unprocessed
+        return {code: tag.value for code, tag in unprocessed.items()}
 
     @staticmethod
     def _merge_dim_guesses(dims_from_meta: str, guessed_dims: str) -> str:
@@ -258,7 +279,8 @@ class Reader(reader.Reader):
         return "".join(best_guess)
 
     def _guess_tiff_dim_order(self, tiff: TiffFile) -> typing.List[str]:
-        scene = tiff.series[self.current_scene_index]
+        tiff_series_idx = self._tiff_series_index(self.current_scene_index)
+        scene = tiff.series[tiff_series_idx]
         dims_from_meta = scene.pages.axes
 
         # If all dims are known, simply return as list
@@ -289,42 +311,63 @@ class Reader(reader.Reader):
         return list(self._dim_order)
 
     def _get_channel_names_for_scene(
-        self, image_shape: typing.Tuple[int], dims: typing.List[str]
+        self, image_shape: typing.Tuple[int, ...], dims: typing.List[str]
     ) -> typing.Optional[typing.List[str]]:
         # Fast return in None case
-        if self._channel_names is None:
+        if self._channel_names is not None:
+            # If channels was provided as a list of lists
+            if isinstance(self._channel_names[0], list):
+                scene_channels = self._channel_names[self.current_scene_index]
+            elif all(isinstance(c, str) for c in self._channel_names):
+                scene_channels = self._channel_names  # type: ignore
+            else:
+                return None
+
+            # If scene channels isn't None and no channel dimension raise error
+            if dimensions.DimensionNames.Channel not in dims:
+                raise exceptions.ConflictingArgumentsError(
+                    f"Provided channel names for scene with no channel dimension. "
+                    f"Scene dims: {dims}, "
+                    f"Provided channel names: {scene_channels}"
+                )
+
+            # If scene channels isn't the same length as the size of channel dim
+            if (
+                len(scene_channels)
+                != image_shape[dims.index(dimensions.DimensionNames.Channel)]
+            ):
+                raise exceptions.ConflictingArgumentsError(
+                    f"Number of channel names provided does not match the "
+                    f"size of the channel dimension for this scene. "
+                    f"Scene shape: {image_shape}, "
+                    f"Dims: {dims}, "
+                    f"Provided channel names: {self._channel_names}",
+                )
+
+            return scene_channels  # type: ignore
+
+        # derive channel names from qptiff metadata if not user-provided
+        meta = self.qpi_metadata
+        if not meta.channels:
             return None
 
-        # If channels was provided as a list of lists
-        if isinstance(self._channel_names[0], list):
-            scene_channels = self._channel_names[self.current_scene_index]
-        elif all(isinstance(c, str) for c in self._channel_names):
-            scene_channels = self._channel_names  # type: ignore
-        else:
-            return None
+        ch_dim = dimensions.DimensionNames.Channel
+        samples_dim = "S" # qptiff; brightfield rgb uses S samples not C
 
-        # If scene channels isn't None and no channel dimension raise error
-        if dimensions.DimensionNames.Channel not in dims:
-            raise exceptions.ConflictingArgumentsError(
-                f"Provided channel names for scene with no channel dimension. "
-                f"Scene dims: {dims}, "
-                f"Provided channel names: {scene_channels}"
-            )
+        if ch_dim in dims:
+            n = image_shape[dims.index(ch_dim)]
+            names = meta.channel_names
+            if len(names) >= n:
+                return names[:n]
+            return names + [f"Channel_{i}" for i in range(len(names), n)]
 
-        # If scene channels isn't the same length as the size of channel dim
-        if (
-            len(scene_channels)
-            != image_shape[dims.index(dimensions.DimensionNames.Channel)]
-        ):
-            raise exceptions.ConflictingArgumentsError(
-                f"Number of channel names provided does not match the "
-                f"size of the channel dimension for this scene. "
-                f"Scene shape: {image_shape}, "
-                f"Dims: {dims}, "
-                f"Provided channel names: {self._channel_names}",
-            )
+        if samples_dim in dims:
+            n = image_shape[dims.index(samples_dim)]
+            names = meta.channel_names
+            if len(names) == n:
+                return names
 
-        return scene_channels  # type: ignore
+        return None
 
     @staticmethod
     def _get_coords(
@@ -333,21 +376,29 @@ class Reader(reader.Reader):
         scene_index: int,
         channel_names: typing.Optional[typing.List[str]],
     ) -> typing.Dict[str, typing.Any]:
-        # Use dims for coord determination
         coords: typing.Dict[str, typing.Any] = {}
+        ch_dim = dimensions.DimensionNames.Channel  # "C"
+        samples_dim = "S"
+
+        # Determine which dimension actually holds the channel/sample axis
+        if ch_dim in dims:
+            active_dim = ch_dim
+        elif samples_dim in dims:
+            active_dim = samples_dim
+        else:
+            active_dim = None
 
         if channel_names is None:
-            # Get ImageId for channel naming
-            image_id = generate_ome_image_id(scene_index)
-
-            # Use range for channel indices
-            if dimensions.DimensionNames.Channel in dims:
-                coords[dimensions.DimensionNames.Channel] = [
+            if active_dim == ch_dim:
+                image_id = generate_ome_image_id(scene_index)
+                coords[ch_dim] = [
                     generate_ome_channel_id(image_id=image_id, channel_id=i)
-                    for i in range(shape[dims.index(dimensions.DimensionNames.Channel)])
+                    for i in range(shape[dims.index(ch_dim)])
                 ]
+            # No auto-coords for Samples dim — leave unlabelled
         else:
-            coords[dimensions.DimensionNames.Channel] = channel_names
+            if active_dim is not None:
+                coords[active_dim] = channel_names
 
         return coords
 
@@ -368,16 +419,18 @@ class Reader(reader.Reader):
         image_data: da.Array
             The fully constructed and fully delayed image as a Dask Array object.
         """
+
         # Always add the plane dimensions if not present already
         for dim in dimensions.REQUIRED_CHUNK_DIMS:
             if dim not in self.chunk_dims:
                 self.chunk_dims.append(dim)
-
+        
         # Safety measure / "feature"
         self.chunk_dims = [d.upper() for d in self.chunk_dims]
 
-        # Construct delayed dask array
-        selected_scene = tiff.series[self.current_scene_index]
+        # Construct delayed dask array for the current remapped scene index
+        tiff_series_idx = self._tiff_series_index(self.current_scene_index)
+        selected_scene = tiff.series[tiff_series_idx]
         selected_scene_dims = "".join(selected_scene_dims_list)
 
         # Raise invalid dims error
@@ -392,10 +445,11 @@ class Reader(reader.Reader):
         # Constuct the chunk and non-chunk shapes one dim at a time
         # We also collect the chunk and non-chunk dimension order so that
         # we can swap the dimensions after we block out the array
-        non_chunk_dim_order = []
-        non_chunk_shape = []
-        chunk_dim_order = []
-        chunk_shape = []
+        non_chunk_dim_order: typing.List[str] = []
+        non_chunk_shape: typing.List[int] = []
+        chunk_dim_order: typing.List[str] = []
+        chunk_shape: typing.List[int] = []
+
         for dim, size in zip(selected_scene_dims, selected_scene.shape):
             if dim in self.chunk_dims:
                 chunk_dim_order.append(dim)
@@ -413,7 +467,7 @@ class Reader(reader.Reader):
 
         # Construct the transpose indices that will be used to
         # transpose the array prior to pulling the chunk dims
-        match_map = {dim: selected_scene_dims.find(dim) for dim in selected_scene_dims}
+        match_map = {d: selected_scene_dims.find(d) for d in selected_scene_dims}
         transposer = []
         for dim in blocked_dim_order:
             transposer.append(match_map[dim])
@@ -432,7 +486,7 @@ class Reader(reader.Reader):
                 delayed(Reader._get_image_data)(
                     fs=self._fs,
                     path=self._path,
-                    scene=self.current_scene_index,
+                    scene=tiff_series_idx,
                     retrieve_indices=indices_with_slices,
                     transpose_indices=transposer,
                 ),
@@ -497,15 +551,24 @@ class Reader(reader.Reader):
                 )
 
                 # Try accepted processed metadata
-                try:
-                    attrs = {
-                        constants.METADATA_UNPROCESSED: tiff_tags,
-                        constants.METADATA_PROCESSED: tiff_tags[
-                            TIFF_IMAGE_DESCRIPTION_TAG_INDEX
-                        ],
-                    }
-                except KeyError:
-                    attrs = {constants.METADATA_UNPROCESSED: tiff_tags}
+                # qptiff: if qpi xml present, rich attrs;
+                tiff_series_idx = self._tiff_series_index(self.current_scene_index)                   
+                series = tiff.series[tiff_series_idx]
+                xml = extract_qpi_xml_from_page(series.pages[0])
+
+                if xml:
+                    meta = self._get_or_parse_meta(tiff_series_idx, xml, series)                      
+                    attrs = self._build_attrs(tiff_tags, meta)
+                else: # default non-qpi
+                    try:
+                        attrs = {
+                            constants.METADATA_UNPROCESSED: tiff_tags,
+                            constants.METADATA_PROCESSED: tiff_tags[
+                                TIFF_IMAGE_DESCRIPTION_TAG_INDEX
+                            ],
+                        }
+                    except KeyError:
+                        attrs = {constants.METADATA_UNPROCESSED: tiff_tags}
 
                 return xr.DataArray(
                     image_data,
@@ -533,7 +596,8 @@ class Reader(reader.Reader):
                 dims = self._get_dims_for_scene(tiff)
 
                 # Read image into memory
-                image_data = tiff.series[self.current_scene_index].asarray()
+                tiff_series_idx = self._tiff_series_index(self.current_scene_index)
+                image_data = tiff.series[tiff_series_idx].asarray()
 
                 # Get unprocessed metadata from tags
                 tiff_tags = self._get_tiff_tags(tiff)
@@ -550,15 +614,24 @@ class Reader(reader.Reader):
                 )
 
                 # Try accepted processed metadata
-                try:
-                    attrs = {
-                        constants.METADATA_UNPROCESSED: tiff_tags,
-                        constants.METADATA_PROCESSED: tiff_tags[
-                            TIFF_IMAGE_DESCRIPTION_TAG_INDEX
-                        ],
-                    }
-                except KeyError:
-                    attrs = {constants.METADATA_UNPROCESSED: tiff_tags}
+                # qptiff: if qpi xml present, rich attrs;
+                tiff_series_idx = self._tiff_series_index(self.current_scene_index)                   
+                series = tiff.series[tiff_series_idx]
+                xml = extract_qpi_xml_from_page(series.pages[0])
+
+                if xml:
+                    meta = self._get_or_parse_meta(tiff_series_idx, xml, series)                      
+                    attrs = self._build_attrs(tiff_tags, meta)
+                else:
+                    try:
+                        attrs = {
+                            constants.METADATA_UNPROCESSED: tiff_tags,
+                            constants.METADATA_PROCESSED: tiff_tags[
+                                TIFF_IMAGE_DESCRIPTION_TAG_INDEX
+                            ],
+                        }
+                    except KeyError:
+                        attrs = {constants.METADATA_UNPROCESSED: tiff_tags}
 
                 return xr.DataArray(
                     image_data,
@@ -566,6 +639,141 @@ class Reader(reader.Reader):
                     coords=coords,
                     attrs=attrs,
                 )
+
+    # qptiff
+    def _build_scene_map(
+        self, tiff: TiffFile
+    ) -> typing.Tuple[typing.Tuple[str, ...], typing.Dict[int, int]]:
+        """
+        Build scene names and a mapping {scene_index: tifffile_series_index}.
+
+        Mainly for qptiff images, where multiple tiff files are stored as
+        tiff series elements. These usually correspond to thumbnails, overviews, labels, and
+        the full image. This function orders the full res image to the 0th index in the mapping.
+        Aux images follow in the order that they appeared in the original file.
+
+        Parameters
+        ----------
+        tiff: TiffFile
+            The opened tifffile.TiffFile object.
+        
+        Returns
+        ----------
+        Tuple:
+            scene_names: Tuple[str, ...]
+                Ordered tuple of human readable scene names.
+            scene_series_map: Dict[[int, int]]
+                Map of each scene index to a tiff file series index.
+        """
+        full_res: typing.List[typing.Tuple[int, str]] = [] # Full resolution image
+        aux: typing.List[typing.Tuple[int, str]] = [] # Auxiliary images; Thumbnails, Labels, etc
+
+        for tiff_idx, series in enumerate(tiff.series):
+            xml = extract_qpi_xml_from_page(series.pages[0])
+            if xml:
+                meta = self._get_or_parse_meta(tiff_idx, xml, series)
+                image_type = meta.image_type or f"Series_{tiff_idx}"
+                if image_type == FULL_RESOLUTION_TYPE:
+                    full_res.append((tiff_idx, image_type))
+                else:
+                    aux.append((tiff_idx, image_type))
+            else: # fallback to non-metadata tiff default, previously in scenes property
+                full_res.append((tiff_idx, generate_ome_image_id(tiff_idx)))
+
+        candidates = full_res + (aux if self._include_aux_series else [])
+        if not candidates: # fall back to defaults
+            candidates = [(0, generate_ome_image_id(0))]
+
+        scene_names: typing.List[str] = []
+        scene_series_map: typing.Dict[int, int] = {}
+        seen: typing.Dict[str, int] = {} # in case of duplicate tags
+
+        for tiff_idx, name in candidates:
+            # dedupe names, ie FullResolution -> FullResolution_1
+            count = seen.get(name, 0)
+            seen[name] = count + 1
+            unique = name if count == 0 else f"{name}_{count}"
+            scene_idx = len(scene_names)
+            scene_names.append(unique)
+            scene_series_map[scene_idx] = tiff_idx
+
+        return tuple(scene_names), scene_series_map
+
+    # qptiff
+    def _tiff_series_index(self, scene_idx: int) -> int:
+        """Map scene index to the underlying tifffile series index."""
+        if self._scene_series_map is None:
+            _ = self.scenes
+        assert self._scene_series_map is not None
+        return self._scene_series_map.get(scene_idx, scene_idx)
+
+    # qptiff
+    def _get_or_parse_meta(
+        self,
+        tiff_series_idx: int,
+        xml: str,
+        series: typing.Any,
+    ) -> QptiffMetadata:
+        if tiff_series_idx not in self._qpi_meta_cache:
+            axes = getattr(series.pages, "axes", "")
+            shape = series.shape
+            n_channels: typing.Optional[int] = None
+            if "C" in axes:
+                n_channels = shape[axes.index("C")]
+            elif "S" in axes:
+                n_channels = shape[axes.index("S")]
+            datetime_str = extract_datetime_from_page(series.pages[0])
+
+            # Collect per-page XMLs for newer Fusion files where biomarker
+            # names are stored one-per-page rather than in ScanBands-i.
+            per_page_xmls: typing.List[str] = []
+            try:
+                for page in series.pages:
+                    per_page_xmls.append(extract_qpi_xml_from_page(page))
+            except Exception:
+                per_page_xmls = []
+
+            self._qpi_meta_cache[tiff_series_idx] = parse_qpi_xml(
+                xml,
+                n_channels=n_channels,
+                datetime_str=datetime_str,
+                per_page_xmls=per_page_xmls if per_page_xmls else None,
+            )
+        return self._qpi_meta_cache[tiff_series_idx]
+
+    # qptiff
+    @property
+    def qpi_metadata(self) -> QptiffMetadata:
+        """
+        Structured QPI metadata for the active scene.
+
+        Returns the QptiffMetadata parsed from the PerkinElmer QPI XML of
+        the active scene's tifffile series.  Returns an empty QptiffMetadata
+        if the file contains no QPI XML.
+        """
+        tiff_series_idx = self._tiff_series_index(self.current_scene_index)
+        if tiff_series_idx in self._qpi_meta_cache:
+            return self._qpi_meta_cache[tiff_series_idx]
+
+        with self._fs.open(self._path) as open_resource:
+            with TiffFile(open_resource, is_mmstack=False) as tiff:
+                series = tiff.series[tiff_series_idx]
+                xml = extract_qpi_xml_from_page(series.pages[0])
+                return self._get_or_parse_meta(tiff_series_idx, xml, series)
+
+    # qptiff
+    def _build_attrs(
+        self,
+        tiff_tags: typing.Dict[int, typing.Any],
+        meta: QptiffMetadata,
+    ) -> typing.Dict[str, typing.Any]:
+        attrs: typing.Dict[str, typing.Any] = {
+            constants.METADATA_UNPROCESSED: tiff_tags,
+        }
+        if meta.raw_xml:
+            attrs[constants.METADATA_PROCESSED] = meta.raw_xml
+        attrs.update(meta.to_dict())
+        return attrs
 
 
 _NAME_TO_MICRONS = {
