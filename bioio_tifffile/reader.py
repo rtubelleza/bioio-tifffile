@@ -666,9 +666,9 @@ class Reader(reader.Reader):
                 Map of each scene index to a tiff file series index.
         """
         full_res: typing.List[typing.Tuple[int, str]] = []  # Full resolution image
-        aux: typing.List[typing.Tuple[int, str]] = (
-            []
-        )  # Auxiliary images; Thumbnails, Labels, etc
+        aux: typing.List[
+            typing.Tuple[int, str]
+        ] = []  # Auxiliary images; Thumbnails, Labels, etc
 
         for tiff_idx, series in enumerate(tiff.series):
             xml = extract_qpi_xml_from_page(series.pages[0])
