@@ -230,7 +230,7 @@ def _bool(element: Optional[ET.Element]) -> Optional[bool]:
 
 
 def _find_first(root: ET.Element, *tags: str) -> Optional[str]:
-    """Search for any of the given tags anywhere in *root* and return first text found."""
+    """Search for any of the given tags anywhere in *root* and return first text."""
     for tag in tags:
         el = root.find(f".//{tag}")
         if el is not None and el.text:

@@ -93,6 +93,7 @@ def test_qptiff_reader_rejects_non_qptiff(sample_text_file: pathlib.Path) -> Non
     with pytest.raises(exceptions.UnsupportedFileFormatError):
         Reader(sample_text_file)
 
+
 BRIGHTFIELD_XML = """\
 <?xml version="1.0" encoding="utf-16"?>
 <PerkinElmer-QPI-ImageDescription>
@@ -282,20 +283,29 @@ class TestParseQpiXml:
           <ScanProfile><root><Mode>im_Fluorescence</Mode></root></ScanProfile>
         </PerkinElmer-QPI-ImageDescription>"""
         meta = parse_qpi_xml(xml, n_channels=4)
-        assert meta.channel_names == ["Channel_0", "Channel_1", "Channel_2", "Channel_3"]
+        assert meta.channel_names == [
+            "Channel_0",
+            "Channel_1",
+            "Channel_2",
+            "Channel_3",
+        ]
 
     def test_opal_wavelength_inferred_from_name(self) -> None:
-        """Emission wavelength should be extracted from fluorophore name e.g. OPAL520."""
+        """Emission wavelength should be extracted from fluorophore name e.g. OPAL520."""  # noqa: E501
         xml = """\
         <PerkinElmer-QPI-ImageDescription>
           <ScanProfile><root><Mode>im_Fluorescence</Mode>
             <ScanBands>
-              <ScanBands-i><Biomarker>TestBiomarker</Biomarker><Fluorophore>OPAL520</Fluorophore></ScanBands-i>
+              <ScanBands-i>
+                <Biomarker>TestBiomarker</Biomarker>
+                <Fluorophore>OPAL520</Fluorophore>
+              </ScanBands-i>
             </ScanBands>
           </root></ScanProfile>
         </PerkinElmer-QPI-ImageDescription>"""
         meta = parse_qpi_xml(xml)
         assert meta.channels[0].emission_wavelength_nm == pytest.approx(520.0)
+
 
 @pytest.mark.parametrize(
     "filename, "

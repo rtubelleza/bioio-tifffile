@@ -31,7 +31,7 @@ from .utils import generate_ome_channel_id, generate_ome_image_id
 UNKNOWN_DIM_CHARS = ["Q", "I"]
 TIFF_IMAGE_DESCRIPTION_TAG_INDEX = 270
 
-FULL_RESOLUTION_TYPE = "FullResolution" # qptiff
+FULL_RESOLUTION_TYPE = "FullResolution"  # qptiff
 
 log = logging.getLogger(__name__)
 
@@ -72,9 +72,11 @@ class Reader(reader.Reader):
     _physical_pixel_sizes: typing.Optional[types.PhysicalPixelSizes] = None
 
     # qptiff
-    _scene_series_map: typing.Optional[typing.Dict[int, int]] = None # qptiffs hold multiple tiff images, where series elements are thumbnails, labels, overview, etc.
-    _qpi_meta_cache: typing.Dict[int, QptiffMetadata] # parsed XML fields of each tiff image series above. keys match above mapping
-    
+    # qptiff: maps scene index → tifffile series index (thumbnails, labels, etc.)
+    _scene_series_map: typing.Optional[typing.Dict[int, int]] = None
+    # qptiff: parsed XML metadata per tifffile series index
+    _qpi_meta_cache: typing.Dict[int, QptiffMetadata]
+
     @staticmethod
     def _is_supported_image(
         fs: AbstractFileSystem, path: str, **kwargs: typing.Any
@@ -131,7 +133,7 @@ class Reader(reader.Reader):
                     f"Number of scenes: {len(self.scenes)}, "
                     f"Number of provided dimension order strings: {len(dim_order)}"
                 )
-        
+
         # If provided a list
         if isinstance(channel_names, list):
             # If provided a list of lists
@@ -184,15 +186,13 @@ class Reader(reader.Reader):
             else:
                 with self._fs.open(self._path) as open_resource:
                     try:
-                        z, y, x = _get_pixel_size(
-                            open_resource, tiff_series_idx
-                        )
+                        z, y, x = _get_pixel_size(open_resource, tiff_series_idx)
                     except Exception as exc:
                         warnings.warn(f"Could not parse QPTIFF pixel size: {exc}")
                         z, y, x = None, None, None
                 self._physical_pixel_sizes = types.PhysicalPixelSizes(z, y, x)
         return self._physical_pixel_sizes
-    
+
     @staticmethod
     def _get_image_data(
         fs: AbstractFileSystem,
@@ -352,7 +352,7 @@ class Reader(reader.Reader):
             return None
 
         ch_dim = dimensions.DimensionNames.Channel
-        samples_dim = "S" # qptiff; brightfield rgb uses S samples not C
+        samples_dim = "S"  # qptiff; brightfield rgb uses S samples not C
 
         if ch_dim in dims:
             n = image_shape[dims.index(ch_dim)]
@@ -424,7 +424,7 @@ class Reader(reader.Reader):
         for dim in dimensions.REQUIRED_CHUNK_DIMS:
             if dim not in self.chunk_dims:
                 self.chunk_dims.append(dim)
-        
+
         # Safety measure / "feature"
         self.chunk_dims = [d.upper() for d in self.chunk_dims]
 
@@ -552,14 +552,14 @@ class Reader(reader.Reader):
 
                 # Try accepted processed metadata
                 # qptiff: if qpi xml present, rich attrs;
-                tiff_series_idx = self._tiff_series_index(self.current_scene_index)                   
+                tiff_series_idx = self._tiff_series_index(self.current_scene_index)
                 series = tiff.series[tiff_series_idx]
                 xml = extract_qpi_xml_from_page(series.pages[0])
 
                 if xml:
-                    meta = self._get_or_parse_meta(tiff_series_idx, xml, series)                      
+                    meta = self._get_or_parse_meta(tiff_series_idx, xml, series)
                     attrs = self._build_attrs(tiff_tags, meta)
-                else: # default non-qpi
+                else:  # default non-qpi
                     try:
                         attrs = {
                             constants.METADATA_UNPROCESSED: tiff_tags,
@@ -615,12 +615,12 @@ class Reader(reader.Reader):
 
                 # Try accepted processed metadata
                 # qptiff: if qpi xml present, rich attrs;
-                tiff_series_idx = self._tiff_series_index(self.current_scene_index)                   
+                tiff_series_idx = self._tiff_series_index(self.current_scene_index)
                 series = tiff.series[tiff_series_idx]
                 xml = extract_qpi_xml_from_page(series.pages[0])
 
                 if xml:
-                    meta = self._get_or_parse_meta(tiff_series_idx, xml, series)                      
+                    meta = self._get_or_parse_meta(tiff_series_idx, xml, series)
                     attrs = self._build_attrs(tiff_tags, meta)
                 else:
                     try:
@@ -648,15 +648,15 @@ class Reader(reader.Reader):
         Build scene names and a mapping {scene_index: tifffile_series_index}.
 
         Mainly for qptiff images, where multiple tiff files are stored as
-        tiff series elements. These usually correspond to thumbnails, overviews, labels, and
-        the full image. This function orders the full res image to the 0th index in the mapping.
-        Aux images follow in the order that they appeared in the original file.
+        tiff series elements. These usually correspond to thumbnails, overviews,
+        labels, and the full image. This function orders the full res image to
+        the 0th index in the mapping. Aux images follow in the original order.
 
         Parameters
         ----------
         tiff: TiffFile
             The opened tifffile.TiffFile object.
-        
+
         Returns
         ----------
         Tuple:
@@ -665,8 +665,10 @@ class Reader(reader.Reader):
             scene_series_map: Dict[[int, int]]
                 Map of each scene index to a tiff file series index.
         """
-        full_res: typing.List[typing.Tuple[int, str]] = [] # Full resolution image
-        aux: typing.List[typing.Tuple[int, str]] = [] # Auxiliary images; Thumbnails, Labels, etc
+        full_res: typing.List[typing.Tuple[int, str]] = []  # Full resolution image
+        aux: typing.List[typing.Tuple[int, str]] = (
+            []
+        )  # Auxiliary images; Thumbnails, Labels, etc
 
         for tiff_idx, series in enumerate(tiff.series):
             xml = extract_qpi_xml_from_page(series.pages[0])
@@ -677,16 +679,16 @@ class Reader(reader.Reader):
                     full_res.append((tiff_idx, image_type))
                 else:
                     aux.append((tiff_idx, image_type))
-            else: # fallback to non-metadata tiff default, previously in scenes property
+            else:  # fallback: non-qpi tiff, treat as full resolution scene
                 full_res.append((tiff_idx, generate_ome_image_id(tiff_idx)))
 
         candidates = full_res + (aux if self._include_aux_series else [])
-        if not candidates: # fall back to defaults
+        if not candidates:  # fall back to defaults
             candidates = [(0, generate_ome_image_id(0))]
 
         scene_names: typing.List[str] = []
         scene_series_map: typing.Dict[int, int] = {}
-        seen: typing.Dict[str, int] = {} # in case of duplicate tags
+        seen: typing.Dict[str, int] = {}  # in case of duplicate tags
 
         for tiff_idx, name in candidates:
             # dedupe names, ie FullResolution -> FullResolution_1
