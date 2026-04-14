@@ -18,6 +18,7 @@ license = { text = "MIT License" }
 authors = [
   { email = "evamaxfieldbrown@gmail.com", name = "Eva Maxfield Brown" },
   { email = "seanm@alleninstitute.org", name = "Sean Meharry" },
+  { email = "rafaelrtubelleza@gmail.com", name = "Rafael Tubelleza" },
 ]
 classifiers = [
   "Development Status :: 4 - Beta",

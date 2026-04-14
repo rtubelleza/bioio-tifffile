@@ -5,29 +5,21 @@ from typing import List
 
 import bioio_base.reader_metadata
 
-###############################################################################
-
 
 class ReaderMetadata(bioio_base.reader_metadata.ReaderMetadata):
     """
-    Notes
-    -----
-    Defines metadata for the reader itself (not the image read),
-    such as supported file extensions.
+    Metadata about the bioio-tifffile reader plugin itself
+    (not the image being read).
     """
 
     @staticmethod
     def get_supported_extensions() -> List[str]:
-        """
-        Return a list of file extensions this plugin supports reading.
-        """
-        return ["tif", "tiff", "lsm"]
+        """Return file extensions this plugin supports."""
+        return ["tif", "tiff", "lsm", "qptiff"]
 
     @staticmethod
     def get_reader() -> bioio_base.reader.Reader:
-        """
-        Return the reader this plugin represents
-        """
+        """Return the Reader class for this plugin."""
         from .reader import Reader
 
         return Reader
