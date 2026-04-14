@@ -1,7 +1,9 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-"""Tests for bioio_tifffile Reader and metadata parser."""
+"""Tests for bioio_tifffile Reader and metadata parser.
+Include qptiff file cases.
+"""
 
 import pathlib
 import time
@@ -28,7 +30,7 @@ from .conftest import LOCAL_RESOURCES_DIR
     "expected_channel_names, "
     "expected_physical_pixel_sizes",
     [
-        # Brightfield RGB (YXS): pixel_size from QPI XML (0.25 µm)
+        # brightfield RGB (YXS): pixel_size from QPI XML (0.25 µm)
         (
             "s_1_bf_yx3.qptiff",
             "FullResolution",
@@ -39,7 +41,7 @@ from .conftest import LOCAL_RESOURCES_DIR
             None,  # S-dim names not surfaced via bioio channel_names
             (None, 0.25, 0.25),
         ),
-        # Fluorescence CYX-written-as-QYX: tifffile guesses Q→Z
+        # fluorescence CYX-written-as-QYX: tifffile guesses Q->Z
         # channel_names is None because no C coordinate exists (dim is Z)
         (
             "s_1_fluor_cyx.qptiff",
@@ -444,10 +446,10 @@ def test_tiff_reader(
         Optional[float], Optional[float], Optional[float]
     ],
 ) -> None:
-    # Construct full filepath
+    # construct full filepath
     uri = LOCAL_RESOURCES_DIR / filename
 
-    # Run checks
+    # run checks
     test_utilities.run_image_file_checks(
         ImageContainer=Reader,
         image=uri,
@@ -469,11 +471,7 @@ def test_tiff_reader_with_non_tiff_file(sample_text_file: pathlib.Path) -> None:
 
 
 @pytest.mark.parametrize(
-    "filename, "
-    "first_scene_id, "
-    "first_scene_shape, "
-    "second_scene_id, "
-    "second_scene_shape",
+    "filename, first_scene_id, first_scene_shape, second_scene_id, second_scene_shape",
     [
         (
             "s_3_t_1_c_3_z_5.ome.tiff",
@@ -498,10 +496,9 @@ def test_multi_scene_tiff_reader(
     second_scene_id: str,
     second_scene_shape: Tuple[int, ...],
 ) -> None:
-    # Construct full filepath
+    # construct full filepath
     uri = LOCAL_RESOURCES_DIR / filename
 
-    # Run checks
     test_utilities.run_multi_scene_image_read_checks(
         ImageContainer=Reader,
         image=uri,
@@ -522,7 +519,7 @@ def test_multi_scene_tiff_reader(
         ("ZYXC", "CZYX", "ZYXC"),
         ("TQQYX", "TCZYX", "TCZYX"),
         ("QTQYX", "TCZYX", "CTZYX"),
-        # testing that nothing happens when Q isn't present
+        # testing that nothing happens when Q not present
         ("LTCYX", "DIMOK", "LTCYX"),
     ],
 )
@@ -539,15 +536,14 @@ def test_micromanager_ome_tiff_binary_file() -> None:
         / "image_stack_tpzc_50tp_2p_5z_3c_512k_1_MMStack_2-Pos001_000.ome.tif"
     )
 
-    # Even though the file name says it is an OME TIFF, this is
+    # vven though the file name says it is an OME TIFF, this is
     # a binary TIFF file where the actual metadata for all scenes
     # lives in a different image file.
     # (image_stack_tpzc_50tp_2p_5z_3c_512k_1_MMStack_2-Pos000_000.ome.tif)
     # Because of this, we will read "non-main" micromanager files as just
     # normal TIFFs
 
-    # Run image read checks on the first scene
-    # (this files binary data)
+    # run image read checks on the first scene
     test_utilities.run_image_file_checks(
         ImageContainer=Reader,
         image=uri,
@@ -589,14 +585,12 @@ def test_parallel_read(
     """
     This test ensures that our produced dask array can be read in parallel.
     """
-    # Construct full filepath
+    # construct full filepath
     uri = LOCAL_RESOURCES_DIR / filename
 
-    # Init image
     img = Reader(uri, chunk_dims=chunk_dims)
     img.set_scene(set_scene)
 
-    # Init cluster
     cluster = LocalCluster(processes=processes)
     client = Client(cluster)
 
@@ -604,7 +598,6 @@ def test_parallel_read(
     out = img.get_image_dask_data(get_dims, **get_specific_dims).compute()
     assert out.shape == expected_shape
 
-    # Shutdown and then safety measure timeout
     cluster.close()
     client.close()
     time.sleep(5)
@@ -649,27 +642,21 @@ def test_parallel_multifile_tiff_read(
     We specifically test with a Distributed cluster to ensure that we serialize and
     read properly from each file.
     """
-    # Construct full filepath
     uri = LOCAL_RESOURCES_DIR / filename
 
-    # Init image
     img = Reader(uri)
 
-    # Init cluster
     cluster = LocalCluster(processes=processes)
     client = Client(cluster)
 
-    # Select data
     img.set_scene(first_scene)
     first_out = img.get_image_dask_data("TZYX").compute()
     assert first_out.shape == expected_first_chunk_shape
 
-    # Update scene and select data
     img.set_scene(second_scene)
     second_out = img.get_image_dask_data("TZYX").compute()
     assert second_out.shape == expected_second_chunk_shape
 
-    # Shutdown and then safety measure timeout
     cluster.close()
     client.close()
     time.sleep(5)
@@ -685,9 +672,9 @@ def test_no_scene_prop_access(
     filename: str,
     expected_shape: Tuple[int, ...],
 ) -> None:
-    # Construct full filepath
+    # ccnstruct full filepath
     uri = LOCAL_RESOURCES_DIR / filename
 
-    # Construct image and check no scene call with property access
+    # construct image and check no scene call with property access
     img = Reader(uri)
     assert img.shape == expected_shape

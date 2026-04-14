@@ -8,6 +8,8 @@ Parses the XML embedded in ImageDescription tag (TIFF tag 270) of QPTIFF files
 produced by PerkinElmer Vectra/Polaris/Fusion/CODEX instruments.
 """
 
+from __future__ import annotations
+
 import logging
 import re
 import xml.etree.ElementTree as ET
@@ -34,10 +36,16 @@ FORMAT_UNKNOWN = "unknown"
 
 @dataclass
 class ChannelInfo:
-    """Metadata for a single image channel."""
+    """Canonical metadata for a single image channel.
+
+    Attempt to standardise incoming qptiff metadata fields here for ome_metadata compatability
+    as well.
+    """
 
     index: int
-    name: str  # biomarker / stain or fluorophore name, or rgb for brightfield, H&E, etc.
+    name: (
+        str  # biomarker / stain or fluorophore name, or rgb for brightfield, H&E, etc.
+    )
     fluorophore: Optional[str] = None
     # ExposureTime in the PerkinElmer spec is in microseconds
     exposure_time_us: Optional[float] = None
@@ -53,6 +61,77 @@ class ChannelInfo:
     # Per-channel detector settings (from CameraSettings or per-page XML)
     gain: Optional[float] = None
     binning: Optional[int] = None
+    # Additional per-channel fields present in Fusion 1.x page XMLs
+    objective: Optional[str] = None
+    scale_factor: Optional[float] = None
+    autofluorescence_subtracted: Optional[bool] = None
+    responsivity: Optional[float] = None
+    responsivity_filter_id: Optional[str] = None
+    responsivity_date: Optional[str] = None
+    responsivity_filter_name: Optional[str] = None
+    excitation_filter_name: Optional[str] = None
+    excitation_filter_manufacturer: Optional[str] = None
+    excitation_filter_part_no: Optional[str] = None
+    emission_filter_name: Optional[str] = None
+    emission_filter_manufacturer: Optional[str] = None
+    emission_filter_part_no: Optional[str] = None
+    bit_depth: Optional[int] = None
+    offset_counts: Optional[int] = None
+    camera_orientation: Optional[str] = None
+    roi_x: Optional[int] = None
+    roi_y: Optional[int] = None
+    roi_width: Optional[int] = None
+    roi_height: Optional[int] = None
+
+
+def _format_color(c: Optional[Tuple[int, int, int]]) -> Optional[str]:
+    return f"{c[0]},{c[1]},{c[2]}" if c else None
+
+
+def _format_binning(b: Optional[int]) -> Optional[str]:
+    return f"{b}x{b}" if b is not None else None
+
+
+# declarative schema describing how each ChannelInfo attribute is surfaced
+# as an OME-style key in the flat attrs dict and as an xarray coordinate on
+# the channel axis. Order is preserved when iterating so xarray coord order
+# matches to_dict() output.
+#
+# Tuple layout: (ome_key, channel_info_attr, formatter_or_None)
+CHANNEL_COORD_SCHEMA: List[Tuple[str, str, Optional[object]]] = [
+    # Name is emitted as the channel coord itself, not a sibling coord, so it
+    # is intentionally absent from this schema.
+    ("Channel:Fluor", "fluorophore", None),
+    ("Channel:Color", "color_rgb", _format_color),
+    ("Channel:EmissionWavelength", "emission_wavelength_nm", None),
+    ("Channel:ExcitationWavelength", "excitation_wavelength_nm", None),
+    ("Plane:ExposureTime", "exposure_time_us", None),
+    ("DetectorSettings:Gain", "gain", None),
+    ("DetectorSettings:Binning", "binning", _format_binning),
+    # QPTIFF-specific per-channel fields — no OME equivalent
+    ("qpi_IsUnmixedComponent", "is_unmixed_component", None),
+    ("qpi_SignalUnits", "signal_units", None),
+    ("qpi_Objective", "objective", None),
+    ("qpi_ScaleFactor", "scale_factor", None),
+    ("qpi_AutofluorescenceSubtracted", "autofluorescence_subtracted", None),
+    ("qpi_Responsivity", "responsivity", None),
+    ("qpi_ResponsivityFilterId", "responsivity_filter_id", None),
+    ("qpi_ResponsivityDate", "responsivity_date", None),
+    ("qpi_ResponsivityFilterName", "responsivity_filter_name", None),
+    ("qpi_ExcitationFilterName", "excitation_filter_name", None),
+    ("qpi_ExcitationFilterManufacturer", "excitation_filter_manufacturer", None),
+    ("qpi_ExcitationFilterPartNo", "excitation_filter_part_no", None),
+    ("qpi_EmissionFilterName", "emission_filter_name", None),
+    ("qpi_EmissionFilterManufacturer", "emission_filter_manufacturer", None),
+    ("qpi_EmissionFilterPartNo", "emission_filter_part_no", None),
+    ("qpi_BitDepth", "bit_depth", None),
+    ("qpi_OffsetCounts", "offset_counts", None),
+    ("qpi_CameraOrientation", "camera_orientation", None),
+    ("qpi_ROIX", "roi_x", None),
+    ("qpi_ROIY", "roi_y", None),
+    ("qpi_ROIWidth", "roi_width", None),
+    ("qpi_ROIHeight", "roi_height", None),
+]
 
 
 @dataclass
@@ -85,7 +164,7 @@ class QptiffMetadata:
     element is present in the file.
     """
 
-    # --- File / acquisition identity ---
+    # file acquisition
     description_version: Optional[str] = None
     acquisition_software: Optional[str] = None
     image_type: Optional[str] = None  # "FullResolution", "Thumbnail", "Macro", "Label"
@@ -97,7 +176,7 @@ class QptiffMetadata:
     computer_name: Optional[str] = None
     datetime: Optional[str] = None  # from TIFF tag 306
 
-    # --- Instrument ---
+    # intstruemnt
     instrument_type: Optional[str] = None
     bf_lamp_type: Optional[str] = None
     objective: Optional[str] = None
@@ -106,32 +185,28 @@ class QptiffMetadata:
     is_tma: Optional[bool] = None
     opal_kit_type: Optional[str] = None
 
-    # --- Camera ---
+    # camera
     camera: CameraInfo = field(default_factory=CameraInfo)
 
-    # --- Pixel geometry ---
+    # pixel res
     scan_resolution: ScanResolutionInfo = field(default_factory=ScanResolutionInfo)
 
-    # --- Physical position (from TIFF XPosition/YPosition tags, in µm) ---
+    # tiff x/y position tags
     xposition_um: Optional[float] = None
     yposition_um: Optional[float] = None
 
-    # --- Channels ---
+    # channels
     channels: List[ChannelInfo] = field(default_factory=list)
 
-    # --- Detected format ---
+    # detected format
     acquisition_format: Optional[str] = None  # one of the FORMAT_* constants
 
-    # --- Raw ---
+    # raw
     raw_xml: str = ""
-
-    # ------------------------------------------------------------------
-    # Convenience properties
-    # ------------------------------------------------------------------
 
     @property
     def pixel_size_um(self) -> Optional[float]:
-        """Physical pixel size in µm (shortcut for scan_resolution.pixel_size_um)."""
+        """Pixels per um"""
         return self.scan_resolution.pixel_size_um
 
     @property
@@ -146,7 +221,7 @@ class QptiffMetadata:
             self.scan_mode is not None and "Brightfield" in self.scan_mode
         )
 
-    def to_dict(self) -> Dict:
+    def to_dict(self, *, ome_only: bool = False) -> Dict:
         """
         Flat dictionary for xarray attrs.
 
@@ -155,39 +230,35 @@ class QptiffMetadata:
         specific to the PerkinElmer QPTIFF format with no OME equivalent retain
         the ``qpi_`` prefix.
 
-        Key naming conventions
-        ----------------------
-        ``Pixels:*``             → OME Pixels attributes
-        ``Plane:N:*``            → OME Plane attributes for channel index N
-        ``Channel:N:*``          → OME Channel attributes for channel index N
-        ``DetectorSettings:N:*`` → OME DetectorSettings for channel index N
-        ``Objective:*``          → OME Objective attributes
-        ``Microscope:*``         → OME Microscope / Instrument attributes
-        ``Detector:*``           → OME Detector attributes
-        ``Experimenter:*``       → OME Experimenter attributes
-        ``qpi_*``                → QPTIFF-specific, no OME equivalent
+        When ``ome_only`` is True, entries with the ``qpi_`` prefix are
+        omitted, leaving only keys that map to an OME-XML field.
+
         """
         d: Dict = {
-            # ---- OME Pixels ----
+            # ome pixels
             "Pixels:PhysicalSizeX": self.pixel_size_um,
-            "Pixels:PhysicalSizeXUnit": "µm" if self.pixel_size_um is not None else None,
+            "Pixels:PhysicalSizeXUnit": "um"
+            if self.pixel_size_um is not None
+            else None,
             "Pixels:PhysicalSizeY": self.pixel_size_um,
-            "Pixels:PhysicalSizeYUnit": "µm" if self.pixel_size_um is not None else None,
-            # ---- OME Plane (baseline / first plane positional metadata) ----
+            "Pixels:PhysicalSizeYUnit": "um"
+            if self.pixel_size_um is not None
+            else None,
+            # ome plane (baseline / first plane positional metadata)
             "Plane:PositionX": self.xposition_um,
-            "Plane:PositionXUnit": "µm" if self.xposition_um is not None else None,
+            "Plane:PositionXUnit": "um" if self.xposition_um is not None else None,
             "Plane:PositionY": self.yposition_um,
-            "Plane:PositionYUnit": "µm" if self.yposition_um is not None else None,
-            # ---- OME Experimenter ----
+            "Plane:PositionYUnit": "um" if self.yposition_um is not None else None,
+            # ome experimenter
             "Experimenter:UserName": self.operator_name,
-            # ---- OME Instrument / Microscope ----
+            # ome instrument / microscope
             "Microscope:Model": self.instrument_type,
-            # ---- OME Objective ----
+            # ome objective
             "Objective:Model": self.scan_resolution.objective_name,
             "Objective:NominalMagnification": self.scan_resolution.magnification,
-            # ---- OME Detector ----
+            # ome detector
             "Detector:Model": self.camera.camera_type,
-            # ---- QPTIFF-specific (no OME equivalent) ----
+            # below seems to be qptiff specific. TODO: check if any map to an ome_types object
             "qpi_description_version": self.description_version,
             "qpi_acquisition_software": self.acquisition_software,
             "qpi_image_type": self.image_type,
@@ -210,123 +281,55 @@ class QptiffMetadata:
             "qpi_is_brightfield": self.is_brightfield,
             "qpi_objective": self.objective,
         }
-        # Per-channel OME fields (Channel, Plane, DetectorSettings)
+
         for ch in self.channels:
             i = ch.index
-            # OME Channel
             d[f"Channel:{i}:Name"] = ch.name
-            d[f"Channel:{i}:Fluor"] = ch.fluorophore
-            d[f"Channel:{i}:Color"] = (
-                f"{ch.color_rgb[0]},{ch.color_rgb[1]},{ch.color_rgb[2]}"
-                if ch.color_rgb
-                else None
-            )
-            d[f"Channel:{i}:EmissionWavelength"] = ch.emission_wavelength_nm
-            d[f"Channel:{i}:EmissionWavelengthUnit"] = (
-                "nm" if ch.emission_wavelength_nm is not None else None
-            )
-            d[f"Channel:{i}:ExcitationWavelength"] = ch.excitation_wavelength_nm
-            d[f"Channel:{i}:ExcitationWavelengthUnit"] = (
-                "nm" if ch.excitation_wavelength_nm is not None else None
-            )
-            # OME Plane (Z=0, T=0, C=i)
-            d[f"Plane:{i}:ExposureTime"] = ch.exposure_time_us
-            d[f"Plane:{i}:ExposureTimeUnit"] = (
-                "µs" if ch.exposure_time_us is not None else None
-            )
-            # OME DetectorSettings
-            d[f"DetectorSettings:{i}:Gain"] = ch.gain
-            d[f"DetectorSettings:{i}:Binning"] = (
-                f"{ch.binning}x{ch.binning}" if ch.binning is not None else None
-            )
-            # QPTIFF-specific per-channel fields
-            d[f"qpi_ch{i}_is_unmixed"] = ch.is_unmixed_component
-            d[f"qpi_ch{i}_signal_units"] = ch.signal_units
-        return {k: v for k, v in d.items() if v is not None}
+
+            # units for the two fields where the unit matters
+            if ch.emission_wavelength_nm is not None:
+                d[f"Channel:{i}:EmissionWavelengthUnit"] = "nm"
+            if ch.excitation_wavelength_nm is not None:
+                d[f"Channel:{i}:ExcitationWavelengthUnit"] = "nm"
+            if ch.exposure_time_us is not None:
+                d[f"Plane:{i}:ExposureTimeUnit"] = "us"
+
+            for ome_key, attr, formatter in CHANNEL_COORD_SCHEMA:
+                if ome_only and ome_key.startswith("qpi_"):
+                    continue
+                raw = getattr(ch, attr, None)
+                value = formatter(raw) if formatter else raw  # type: ignore[operator]
+                if value is None:
+                    continue
+                #  ome_key has no index in it (e.g. "Channel:Fluor"); insert
+                # the channel index after the first colon to form
+                # "Channel:N:Fluor" / "qpi_chN_<name>" etc.
+                if ome_key.startswith("qpi_"):
+                    flat_key = f"qpi_ch{i}_{ome_key[4:]}"
+                else:
+                    prefix, _, suffix = ome_key.partition(":")
+                    flat_key = f"{prefix}:{i}:{suffix}"
+                d[flat_key] = value
+        return {
+            k: v
+            for k, v in d.items()
+            if v is not None and not (ome_only and k.startswith("qpi_"))
+        }
 
 
-###############################################################################
-# OME-structured metadata dataclasses
-###############################################################################
+def _ome_color(rgb: Optional[Tuple[int, int, int]]) -> Optional["Color"]:
+    if rgb is None:
+        return None
+    try:
+        from ome_types.model import Color
+
+        return Color(f"#{rgb[0]:02x}{rgb[1]:02x}{rgb[2]:02x}")
+    except Exception:
+        return None
 
 
-@dataclass
-class OMEChannel:
-    """
-    OME Channel + DetectorSettings + per-plane metadata for one channel.
-
-    Field names follow the OME-XML specification:
-    https://ome-model.readthedocs.io/en/stable/ome-xml/
-    """
-
-    index: int
-    # OME Channel
-    name: Optional[str] = None  # Channel.Name
-    fluor: Optional[str] = None  # Channel.Fluor
-    color: Optional[Tuple[int, int, int]] = None  # Channel.Color (r, g, b)
-    emission_wavelength_nm: Optional[float] = None  # Channel.EmissionWavelength
-    excitation_wavelength_nm: Optional[float] = None  # Channel.ExcitationWavelength
-    # OME Plane (Z=0, T=0, C=index)
-    exposure_time_us: Optional[float] = None  # Plane.ExposureTime (µs)
-    # OME DetectorSettings
-    gain: Optional[float] = None  # DetectorSettings.Gain
-    binning: Optional[str] = None  # DetectorSettings.Binning ("NxN")
-    # QPTIFF-specific (no OME equivalent)
-    is_unmixed_component: Optional[bool] = None
-    signal_units: Optional[int] = None
-
-
-@dataclass
-class OMEInstrument:
-    """OME Instrument / Objective / Detector metadata."""
-
-    microscope_model: Optional[str] = None  # Microscope.Model ← InstrumentType
-    detector_model: Optional[str] = None  # Detector.Model ← CameraType
-    objective_model: Optional[str] = None  # Objective.Model
-    objective_magnification: Optional[float] = None  # Objective.NominalMagnification
-    # Extra — camera name not in OME but useful for identification
-    camera_name: Optional[str] = None
-
-
-@dataclass
-class OMEMetadata:
-    """
-    OME-structured metadata for a single QPTIFF scene.
-
-    Populated from the PerkinElmer QPI XML and TIFF tags.  Fields mirror the
-    OME-XML data model (https://ome-model.readthedocs.io/en/stable/ome-xml/).
-    Fields with no OME equivalent are kept with a ``qpi_`` prefix on the
-    :class:`QptiffMetadata` source object.
-    """
-
-    # ---- OME Pixels ----
-    physical_size_x_um: Optional[float] = None  # Pixels.PhysicalSizeX
-    physical_size_y_um: Optional[float] = None  # Pixels.PhysicalSizeY
-    size_x: Optional[int] = None  # Pixels.SizeX
-    size_y: Optional[int] = None  # Pixels.SizeY
-    size_z: Optional[int] = None  # Pixels.SizeZ
-    size_c: Optional[int] = None  # Pixels.SizeC
-    size_t: Optional[int] = None  # Pixels.SizeT
-
-    # ---- OME Image ----
-    image_name: Optional[str] = None  # Image.Name
-
-    # ---- OME Experimenter ----
-    experimenter: Optional[str] = None  # Experimenter.UserName ← OperatorName
-
-    # ---- OME Plane (baseline plane, first channel) ----
-    position_x_um: Optional[float] = None  # Plane.PositionX
-    position_y_um: Optional[float] = None  # Plane.PositionY
-
-    # ---- OME Instrument / Objective / Detector ----
-    instrument: OMEInstrument = field(default_factory=OMEInstrument)
-
-    # ---- OME Channels ----
-    channels: List[OMEChannel] = field(default_factory=list)
-
-    # ---- Source ----
-    # The raw QptiffMetadata that produced this object
-    _source: Optional["QptiffMetadata"] = field(default=None, repr=False, compare=False)
+def _str(v: object) -> Optional[str]:
+    return str(v) if v is not None else None
 
 
 def ome_metadata_from_qptiff(
@@ -337,9 +340,22 @@ def ome_metadata_from_qptiff(
     size_z: Optional[int] = None,
     size_c: Optional[int] = None,
     size_t: Optional[int] = None,
-) -> OMEMetadata:
+) -> "OME":
     """
-    Build an :class:`OMEMetadata` from a :class:`QptiffMetadata` instance.
+    Map a :class:`QptiffMetadata` to a fully typed :class:`ome_types.model.OME`
+    object.
+
+    Fields that have a direct OME-XML equivalent are placed on the canonical
+    OME objects (``Channel``, ``Plane``, ``DetectorSettings``, ``Pixels``,
+    ``Instrument``, ``Objective``, ``Detector``, ``Filter``).
+
+    Fields specific to the PerkinElmer QPI format with no OME equivalent are
+    collected into a ``MapAnnotation`` (namespace ``qpi://vectra``) on the
+    ``OME.structured_annotations`` list — one annotation per image and one per
+    channel (prefixed ``ch<N>_``).
+
+    Excitation and emission filter names / manufacturers map to OME ``Filter``
+    objects in ``Instrument.filters``, linked from ``Channel.light_path``.
 
     Parameters
     ----------
@@ -350,54 +366,260 @@ def ome_metadata_from_qptiff(
     size_x, size_y, size_z, size_c, size_t:
         Pixel dimensions of the image at the selected pyramid level.
     """
-    channels = [
-        OMEChannel(
-            index=ch.index,
+    from ome_types.model import (
+        OME,
+        AnnotationRef,
+        Channel,
+        Detector,
+        DetectorSettings,
+        Experimenter,
+        ExperimenterRef,
+        Filter,
+        FilterRef,
+        Image,
+        Instrument,
+        InstrumentRef,
+        LightPath,
+        MapAnnotation,
+        Microscope,
+        Objective,
+        ObjectiveSettings,
+        Pixels,
+        Plane,
+    )
+
+    instrument_id = "Instrument:0"
+    objective_id = "Objective:0"
+    detector_id = "Detector:0"
+    image_id = "Image:0"
+    pixels_id = "Pixels:0"
+    experimenter_id = "Experimenter:0"
+
+    # instrument sub objects
+    microscope = Microscope(model=qpi.instrument_type) if qpi.instrument_type else None
+
+    objective = None
+    if qpi.scan_resolution.objective_name or qpi.scan_resolution.magnification:
+        objective = Objective(
+            id=objective_id,
+            model=qpi.scan_resolution.objective_name,
+            nominal_magnification=qpi.scan_resolution.magnification,
+        )
+
+    detector = None
+    if qpi.camera.camera_type or qpi.camera.camera_name:
+        detector = Detector(
+            id=detector_id,
+            model=qpi.camera.camera_type or qpi.camera.camera_name,
+            gain=qpi.camera.gain,
+        )
+
+    # one pair per channel declaring filter info
+    filters: List[Filter] = []
+    filter_idx = 0
+
+    def _make_filter(
+        name: Optional[str],
+        manufacturer: Optional[str],
+        fid: str,
+    ) -> Optional[Filter]:
+        if not name and not manufacturer:
+            return None
+        return Filter(id=fid, model=name, manufacturer=manufacturer)
+
+    # filter objs, track id per chan
+    exc_filter_ids: Dict[int, str] = {}
+    emi_filter_ids: Dict[int, str] = {}
+
+    for ch in qpi.channels:
+        exc = _make_filter(
+            ch.excitation_filter_name,
+            ch.excitation_filter_manufacturer,
+            f"Filter:{filter_idx}",
+        )
+        if exc:
+            exc_filter_ids[ch.index] = exc.id
+            filters.append(exc)
+            filter_idx += 1
+
+        emi = _make_filter(
+            ch.emission_filter_name,
+            ch.emission_filter_manufacturer,
+            f"Filter:{filter_idx}",
+        )
+        if emi:
+            emi_filter_ids[ch.index] = emi.id
+            filters.append(emi)
+            filter_idx += 1
+
+    instrument = Instrument(
+        id=instrument_id,
+        microscope=microscope,
+        objectives=[objective] if objective else [],
+        detectors=[detector] if detector else [],
+        filters=filters,
+    )
+
+    # experimenter
+    experimenter = None
+    if qpi.operator_name:
+        experimenter = Experimenter(id=experimenter_id, user_name=qpi.operator_name)
+
+    # channels, planes, detector settings
+    ome_channels: List[Channel] = []
+    ome_planes: List[Plane] = []
+
+    for ch in qpi.channels:
+        det_settings = None
+        if ch.gain is not None or ch.binning is not None:
+            det_settings = DetectorSettings(
+                id=detector_id,
+                gain=ch.gain,
+                binning=_format_binning(ch.binning),
+            )
+
+        exc_fid = exc_filter_ids.get(ch.index)
+        emi_fid = emi_filter_ids.get(ch.index)
+        light_path = None
+        if exc_fid or emi_fid:
+            light_path = LightPath(
+                excitation_filters=[FilterRef(id=exc_fid)] if exc_fid else [],
+                emission_filters=[FilterRef(id=emi_fid)] if emi_fid else [],
+            )
+
+        ch_kwargs: Dict[str, object] = dict(
+            id=f"Channel:0:{ch.index}",
             name=ch.name,
             fluor=ch.fluorophore,
-            color=ch.color_rgb,
-            emission_wavelength_nm=ch.emission_wavelength_nm,
-            excitation_wavelength_nm=ch.excitation_wavelength_nm,
-            exposure_time_us=ch.exposure_time_us,
-            gain=ch.gain,
-            binning=(
-                f"{ch.binning}x{ch.binning}" if ch.binning is not None else None
-            ),
-            is_unmixed_component=ch.is_unmixed_component,
-            signal_units=ch.signal_units,
+            detector_settings=det_settings,
+            light_path=light_path,
         )
-        for ch in qpi.channels
+        color = _ome_color(ch.color_rgb)
+        if color is not None:
+            ch_kwargs["color"] = color
+        if ch.emission_wavelength_nm is not None:
+            ch_kwargs["emission_wavelength"] = ch.emission_wavelength_nm
+            ch_kwargs["emission_wavelength_unit"] = "nm"
+        if ch.excitation_wavelength_nm is not None:
+            ch_kwargs["excitation_wavelength"] = ch.excitation_wavelength_nm
+            ch_kwargs["excitation_wavelength_unit"] = "nm"
+        ome_channels.append(Channel(**ch_kwargs))  # type: ignore[arg-type]
+
+        # One Plane per channel (Z=0, T=0).
+        plane_kwargs: Dict[str, object] = dict(the_z=0, the_t=0, the_c=ch.index)
+        if ch.exposure_time_us is not None:
+            plane_kwargs["exposure_time"] = ch.exposure_time_us
+            plane_kwargs["exposure_time_unit"] = "\u00b5s"
+        if qpi.xposition_um is not None:
+            plane_kwargs["position_x"] = qpi.xposition_um
+            plane_kwargs["position_x_unit"] = "\u00b5m"
+        if qpi.yposition_um is not None:
+            plane_kwargs["position_y"] = qpi.yposition_um
+            plane_kwargs["position_y_unit"] = "\u00b5m"
+        ome_planes.append(Plane(**plane_kwargs))  # type: ignore[arg-type]
+
+    px_kwargs: Dict[str, object] = dict(
+        id=pixels_id,
+        dimension_order="XYZCT",
+        type="uint16",
+        size_x=size_x or 1,
+        size_y=size_y or 1,
+        size_z=size_z or 1,
+        size_c=size_c or max(1, len(qpi.channels)),
+        size_t=size_t or 1,
+    )
+    if qpi.pixel_size_um is not None:
+        px_kwargs["physical_size_x"] = qpi.pixel_size_um
+        px_kwargs["physical_size_x_unit"] = "\u00b5m"
+        px_kwargs["physical_size_y"] = qpi.pixel_size_um
+        px_kwargs["physical_size_y_unit"] = "\u00b5m"
+    px_kwargs["channels"] = ome_channels
+    px_kwargs["planes"] = ome_planes
+    pixels = Pixels(**px_kwargs)  # type: ignore[arg-type]
+
+    # image level
+    img_qpi: Dict[str, str] = {}
+    _qpi_map = [
+        ("description_version", qpi.description_version),
+        ("acquisition_software", qpi.acquisition_software),
+        ("image_type", qpi.image_type),
+        ("identifier", qpi.identifier),
+        ("slide_id", qpi.slide_id),
+        ("barcode", qpi.barcode),
+        ("study_name", qpi.study_name),
+        ("computer_name", qpi.computer_name),
+        ("datetime", qpi.datetime),
+        ("bf_lamp_type", qpi.bf_lamp_type),
+        ("scan_profile_name", qpi.scan_profile_name),
+        ("scan_mode", qpi.scan_mode),
+        ("is_tma", _str(qpi.is_tma)),
+        ("opal_kit_type", qpi.opal_kit_type),
+        ("acquisition_format", qpi.acquisition_format),
+        ("camera_name", qpi.camera.camera_name),
+        ("camera_gain", _str(qpi.camera.gain)),
+        ("camera_bit_depth", _str(qpi.camera.bit_depth)),
     ]
+    for k, v in _qpi_map:
+        if v is not None:
+            img_qpi[k] = v
 
-    instrument = OMEInstrument(
-        microscope_model=qpi.instrument_type,
-        detector_model=qpi.camera.camera_type,
-        objective_model=qpi.scan_resolution.objective_name,
-        objective_magnification=qpi.scan_resolution.magnification,
-        camera_name=qpi.camera.camera_name,
+    # channel level
+    for ch in qpi.channels:
+        ch_map = [
+            ("is_unmixed_component", _str(ch.is_unmixed_component)),
+            ("signal_units", _str(ch.signal_units)),
+            ("objective", ch.objective),
+            ("scale_factor", _str(ch.scale_factor)),
+            ("autofluorescence_subtracted", _str(ch.autofluorescence_subtracted)),
+            ("responsivity", _str(ch.responsivity)),
+            ("responsivity_filter_id", ch.responsivity_filter_id),
+            ("responsivity_date", ch.responsivity_date),
+            ("responsivity_filter_name", ch.responsivity_filter_name),
+            ("excitation_filter_part_no", ch.excitation_filter_part_no),
+            ("emission_filter_part_no", ch.emission_filter_part_no),
+            ("bit_depth", _str(ch.bit_depth)),
+            ("offset_counts", _str(ch.offset_counts)),
+            ("camera_orientation", ch.camera_orientation),
+            ("roi_x", _str(ch.roi_x)),
+            ("roi_y", _str(ch.roi_y)),
+            ("roi_width", _str(ch.roi_width)),
+            ("roi_height", _str(ch.roi_height)),
+        ]
+        for k, v in ch_map:
+            if v is not None:
+                img_qpi[f"ch{ch.index}_{k}"] = v
+
+    annotations = []
+    if img_qpi:
+        annotations.append(
+            MapAnnotation(
+                id="Annotation:0",
+                namespace="qpi://vectra",
+                value=img_qpi,
+            )
+        )
+
+    image = Image(
+        id=image_id,
+        name=scene_name,
+        acquisition_date=qpi.datetime,
+        instrument_ref=InstrumentRef(id=instrument_id),
+        objective_settings=ObjectiveSettings(id=objective_id) if objective else None,
+        experimenter_ref=ExperimenterRef(id=experimenter_id) if experimenter else None,
+        pixels=pixels,
+        annotation_refs=[AnnotationRef(id="Annotation:0")] if annotations else [],
     )
 
-    return OMEMetadata(
-        physical_size_x_um=qpi.pixel_size_um,
-        physical_size_y_um=qpi.pixel_size_um,
-        size_x=size_x,
-        size_y=size_y,
-        size_z=size_z,
-        size_c=size_c,
-        size_t=size_t,
-        image_name=scene_name,
-        experimenter=qpi.operator_name,
-        position_x_um=qpi.xposition_um,
-        position_y_um=qpi.yposition_um,
-        instrument=instrument,
-        channels=channels,
-        _source=qpi,
-    )
+    ome_kwargs: Dict[str, object] = {
+        "images": [image],
+        "instruments": [instrument],
+        "structured_annotations": annotations,
+    }
+    if experimenter:
+        ome_kwargs["experimenters"] = [experimenter]
 
+    return OME(**ome_kwargs)  # type: ignore[arg-type]
 
-###############################################################################
-# Parser
-###############################################################################
 
 # XML tag candidates for biomarker name, in priority order
 _BIOMARKER_TAGS = [
@@ -507,7 +729,7 @@ def _parse_camera(root: ET.Element) -> CameraInfo:
 
 
 def _parse_exposure_times(root: ET.Element) -> List[Optional[float]]:
-    """Return list of per-channel exposure times (µs) from ExposureTimeArray.
+    """Return list of per-channel exposure times (us) from ExposureTimeArray.
 
     Per the PerkinElmer spec, ExposureTime values are integer microseconds.
     """
@@ -544,68 +766,31 @@ def _parse_fluorescence_channels(
     Parse per-channel biomarker / fluorophore info from the ScanBands section.
 
     In multiplexed fluorescence QPI files each channel is described inside a
-    ScanBands-i element.  We extract:
-    - biomarker name  (Biomarker / BioMarker / StainName / Marker)
-    - fluorophore     (Fluorophore / Fluor)
-    - emission wavelength (from filter band or fluorophore name)
+    ScanBands-i element.  The per-band element carries everything the
+    Fusion-paged format stores at its page root, so the same extractor is used.
     """
     channels: List[ChannelInfo] = []
     scan_bands = root.findall(".//ScanBands-i")
 
     for idx, band in enumerate(scan_bands):
-        # Try to find biomarker name
-        name: Optional[str] = None
-        for tag in _BIOMARKER_TAGS:
-            el = band.find(f".//{tag}")
-            if el is not None and el.text and el.text.strip() not in ("", "None"):
-                name = el.text.strip()
-                break
-        if name is None:
-            name = f"Channel_{idx}"
+        fields: Dict[str, object] = {"index": idx, "name": f"Channel_{idx}"}
+        _populate_channel_fields_from_element(band, fields)
 
-        # Fluorophore
-        fluorophore: Optional[str] = None
-        for tag in _FLUOROPHORE_TAGS:
-            el = band.find(f".//{tag}")
-            if el is not None and el.text and el.text.strip() not in ("", "None"):
-                fluorophore = el.text.strip()
-                break
+        # Emission wavelength inference from fluorophore name is specific to
+        # the OPAL scan-band format (e.g. "OPAL520" → 520 nm).
+        if "emission_wavelength_nm" not in fields:
+            fluor = fields.get("fluorophore")
+            if isinstance(fluor, str):
+                m = re.search(r"(\d{3,4})", fluor)
+                if m:
+                    fields["emission_wavelength_nm"] = float(m.group(1))
 
-        # Emission wavelength — try HomeWavelength first, infer from fluorophore name
-        emission_nm = _float(band.find(".//HomeWavelength"))
-        if emission_nm is None and fluorophore:
-            m = re.search(r"(\d{3,4})", fluorophore)
-            if m:
-                emission_nm = float(m.group(1))
+        # Exposure times can arrive via ExposureTimeArray rather than per-band.
+        if "exposure_time_us" not in fields:
+            if idx < len(exposure_times) and exposure_times[idx] is not None:
+                fields["exposure_time_us"] = exposure_times[idx]
 
-        # Excitation wavelength
-        excitation_nm = _float(band.find(".//ExcitationWavelength"))
-
-        exposure_us = exposure_times[idx] if idx < len(exposure_times) else None
-
-        color_rgb = _parse_color(band.find(".//Color"))
-        is_unmixed = _bool(band.find(".//IsUnmixedComponent"))
-        signal_units_el = band.find(".//SignalUnits")
-        signal_units = _int(signal_units_el)
-        gain = _float(band.find(".//Gain"))
-        binning = _int(band.find(".//Binning"))
-
-        channels.append(
-            ChannelInfo(
-                index=idx,
-                name=name,
-                fluorophore=fluorophore,
-                exposure_time_us=exposure_us,
-                emission_wavelength_nm=emission_nm,
-                excitation_wavelength_nm=excitation_nm,
-                is_brightfield=False,
-                color_rgb=color_rgb,
-                is_unmixed_component=is_unmixed,
-                signal_units=signal_units,
-                gain=gain,
-                binning=binning,
-            )
-        )
+        channels.append(ChannelInfo(**fields))  # type: ignore[arg-type]
 
     return channels
 
@@ -622,81 +807,154 @@ def _parse_channels_from_per_page_xmls(
     """
     channels: List[ChannelInfo] = []
     for idx, xml in enumerate(per_page_xmls):
-        name = f"Channel_{idx}"
-        fluorophore: Optional[str] = None
-        exposure_us: Optional[float] = None
-        emission_nm: Optional[float] = None
-        excitation_nm: Optional[float] = None
-        color_rgb: Optional[Tuple[int, int, int]] = None
-        is_unmixed: Optional[bool] = None
-        signal_units: Optional[int] = None
-        gain: Optional[float] = None
-        binning: Optional[int] = None
+        fields: Dict[str, object] = {"index": idx, "name": f"Channel_{idx}"}
 
         if xml:
             try:
                 page_root = ET.fromstring(xml)
-                # Search only at direct children to avoid nested <Name> tags
-                for tag in _BIOMARKER_TAGS:
-                    el = page_root.find(tag)
-                    if el is not None and el.text:
-                        val = el.text.strip()
-                        if val and val not in ("None", "--"):
-                            name = val
-                            break
-                # Fluorophore
-                for tag in _FLUOROPHORE_TAGS:
-                    el = page_root.find(tag)
-                    if el is not None and el.text and el.text.strip():
-                        fluorophore = el.text.strip()
-                        break
-                # Exposure time (µs per spec)
-                et_el = page_root.find("ExposureTime")
-                if et_el is not None and et_el.text:
-                    try:
-                        exposure_us = float(et_el.text.strip())
-                    except ValueError:
-                        pass
-                # Emission wavelength — midpoint of first emission band
-                em_band = page_root.find(".//EmissionFilter/Bands/Band")
-                if em_band is not None:
-                    cuton = _float(em_band.find("Cuton"))
-                    cutoff = _float(em_band.find("Cutoff"))
-                    if cuton is not None and cutoff is not None:
-                        emission_nm = (cuton + cutoff) / 2.0
-                # Excitation wavelength — midpoint of first excitation band
-                ex_band = page_root.find(".//ExcitationFilter/Bands/Band")
-                if ex_band is not None:
-                    cuton = _float(ex_band.find("Cuton"))
-                    cutoff = _float(ex_band.find("Cutoff"))
-                    if cuton is not None and cutoff is not None:
-                        excitation_nm = (cuton + cutoff) / 2.0
-                # Display colour, signal type, unmixed flag, detector settings
-                color_rgb = _parse_color(page_root.find("Color"))
-                is_unmixed = _bool(page_root.find("IsUnmixedComponent"))
-                signal_units = _int(page_root.find("SignalUnits"))
-                gain = _float(page_root.find("Gain"))
-                binning = _int(page_root.find("Binning"))
+                _populate_channel_fields_from_element(page_root, fields)
             except ET.ParseError:
                 pass
 
-        channels.append(
-            ChannelInfo(
-                index=idx,
-                name=name,
-                fluorophore=fluorophore,
-                exposure_time_us=exposure_us,
-                emission_wavelength_nm=emission_nm,
-                excitation_wavelength_nm=excitation_nm,
-                is_brightfield=False,
-                color_rgb=color_rgb,
-                is_unmixed_component=is_unmixed,
-                signal_units=signal_units,
-                gain=gain,
-                binning=binning,
-            )
-        )
+        channels.append(ChannelInfo(**fields))  # type: ignore[arg-type]
     return channels
+
+
+def _populate_channel_fields_from_element(
+    elem: ET.Element, fields: Dict[str, object]
+) -> None:
+    """
+    Pull every per-channel field we know how to extract out of a single XML
+    element (either a <ScanBands-i> or a page root) and write it into ``fields``.
+
+    Mutates ``fields`` in place. ``fields`` is a dict that will be passed to
+    ``ChannelInfo(**fields)``; keys must match ChannelInfo attribute names.
+    Values are only set when they parse successfully, so defaults on the
+    dataclass remain in effect when a field is missing from this file.
+    """
+    # Biomarker / stain name
+    for tag in _BIOMARKER_TAGS:
+        el = elem.find(tag)
+        if el is not None and el.text:
+            val = el.text.strip()
+            if val and val not in ("None", "--"):
+                fields["name"] = val
+                break
+
+    # fluorophore
+    for tag in _FLUOROPHORE_TAGS:
+        el = elem.find(tag)
+        if el is not None and el.text and el.text.strip():
+            fields["fluorophore"] = el.text.strip()
+            break
+
+    # exposure time (us per spec)
+    et_text = _text(elem.find("ExposureTime"))
+    if et_text is not None:
+        try:
+            fields["exposure_time_us"] = float(et_text)
+        except ValueError:
+            pass
+
+    # emission / excitation wavelengths
+    em_band = elem.find(".//EmissionFilter/Bands/Band")
+    if em_band is not None:
+        cuton = _float(em_band.find("Cuton"))
+        cutoff = _float(em_band.find("Cutoff"))
+        if cuton is not None and cutoff is not None:
+            fields["emission_wavelength_nm"] = (cuton + cutoff) / 2.0
+
+    ex_band = elem.find(".//ExcitationFilter/Bands/Band")
+    if ex_band is not None:
+        cuton = _float(ex_band.find("Cuton"))
+        cutoff = _float(ex_band.find("Cutoff"))
+        if cuton is not None and cutoff is not None:
+            fields["excitation_wavelength_nm"] = (cuton + cutoff) / 2.0
+
+    # fallback to a <HomeWavelength> element for old ScanBands format
+    if "emission_wavelength_nm" not in fields:
+        hw = _float(elem.find(".//HomeWavelength"))
+        if hw is not None:
+            fields["emission_wavelength_nm"] = hw
+    if "excitation_wavelength_nm" not in fields:
+        ex = _float(elem.find(".//ExcitationWavelength"))
+        if ex is not None:
+            fields["excitation_wavelength_nm"] = ex
+
+    # display colour, signal type, unmixed flag, per-channel detector gain/binning
+    color = _parse_color(elem.find("Color"))
+    if color is None:
+        color = _parse_color(elem.find(".//Color"))
+    if color is not None:
+        fields["color_rgb"] = color
+
+    _set_if(fields, "is_unmixed_component", _bool(elem.find("IsUnmixedComponent")))
+    _set_if(fields, "signal_units", _int(elem.find("SignalUnits")))
+
+    # per chan objective, scale factor, AF subtraction
+    _set_if(fields, "objective", _text(elem.find("Objective")))
+    _set_if(fields, "scale_factor", _float(elem.find("ScaleFactor")))
+    _set_if(
+        fields,
+        "autofluorescence_subtracted",
+        _bool(elem.find("AutofluorescenceSubtracted")),
+    )
+
+    # responsivity / calibration
+    resp = elem.find("Responsivity")
+    if resp is not None:
+        rf = resp.find("Filter")
+        if rf is not None:
+            _set_if(fields, "responsivity", _float(rf.find("Response")))
+            _set_if(fields, "responsivity_filter_id", _text(rf.find("FilterID")))
+            _set_if(fields, "responsivity_date", _text(rf.find("Date")))
+            _set_if(fields, "responsivity_filter_name", _text(rf.find("Name")))
+
+    # xcitation / emission filter identification
+    ex_filter = elem.find("ExcitationFilter")
+    if ex_filter is not None:
+        _set_if(fields, "excitation_filter_name", _text(ex_filter.find("Name")))
+        _set_if(
+            fields,
+            "excitation_filter_manufacturer",
+            _text(ex_filter.find("Manufacturer")),
+        )
+        _set_if(fields, "excitation_filter_part_no", _text(ex_filter.find("PartNo")))
+
+    em_filter = elem.find("EmissionFilter")
+    if em_filter is not None:
+        _set_if(fields, "emission_filter_name", _text(em_filter.find("Name")))
+        _set_if(
+            fields,
+            "emission_filter_manufacturer",
+            _text(em_filter.find("Manufacturer")),
+        )
+        _set_if(fields, "emission_filter_part_no", _text(em_filter.find("PartNo")))
+
+    # per channel detectors
+    cs = elem.find("CameraSettings")
+    if cs is not None:
+        _set_if(fields, "gain", _float(cs.find("Gain")))
+        _set_if(fields, "binning", _int(cs.find("Binning")))
+        _set_if(fields, "bit_depth", _int(cs.find("BitDepth")))
+        _set_if(fields, "offset_counts", _int(cs.find("OffsetCounts")))
+        _set_if(fields, "camera_orientation", _text(cs.find("Orientation")))
+        roi = cs.find("ROI")
+        if roi is not None:
+            _set_if(fields, "roi_x", _int(roi.find("X")))
+            _set_if(fields, "roi_y", _int(roi.find("Y")))
+            _set_if(fields, "roi_width", _int(roi.find("Width")))
+            _set_if(fields, "roi_height", _int(roi.find("Height")))
+    else:
+        # older ScanBands format stores Gain/Binning directly on the band
+        _set_if(fields, "gain", _float(elem.find(".//Gain")))
+        _set_if(fields, "binning", _int(elem.find(".//Binning")))
+
+
+def _set_if(target: Dict[str, object], key: str, value: object) -> None:
+    """Write ``value`` into ``target[key]`` only when it is not None."""
+    if value is not None:
+        target[key] = value
 
 
 def _detect_format(
@@ -705,10 +963,9 @@ def _detect_format(
     bf_lamp_type: Optional[str],
 ) -> str:
     """
-    Identify which QPTIFF format variant produced this file.
+    Identify which QPTIFF format variant produced this file.. a couple of versions
+    as qptiff evolved from vectra
 
-    Detection priority
-    ------------------
     1. **brightfield** — scan_mode contains "Brightfield" (case-insensitive) or
        a ``<BFLampType>`` element is present (brightfield-only tag).
     2. **polaris_scanband** — ``<ScanBands-i>`` elements are present anywhere in
@@ -741,8 +998,6 @@ def parse_qpi_xml(
     """
     Parse the PerkinElmer QPI ImageDescription XML and return a QptiffMetadata.
 
-    Parameters
-    ----------
     xml_string:
         The raw XML string from TIFF tag 270 of the first page.
     n_channels:
@@ -755,8 +1010,7 @@ def parse_qpi_xml(
         PerkinElmer Fusion files where channel-level metadata (Biomarker,
         ExposureTime, filters) is stored per-page rather than in ScanBands-i.
 
-    Returns
-    -------
+
     QptiffMetadata
         Fully populated (where data is available) metadata object.
     """
@@ -771,11 +1025,10 @@ def parse_qpi_xml(
         log.warning("Failed to parse QPI XML: %s", exc)
         return meta
 
-    # Validate root tag
+    # validate root tag
     if "PerkinElmer-QPI" not in root.tag and "PerkinElmerQPI" not in root.tag:
         log.debug("XML root %r not a recognised QPI description", root.tag)
 
-    # --- Top-level scalars ---
     meta.description_version = _text(root.find("DescriptionVersion"))
     meta.acquisition_software = _text(root.find("AcquisitionSoftware"))
     meta.image_type = _text(root.find("ImageType"))
@@ -789,7 +1042,6 @@ def parse_qpi_xml(
     meta.bf_lamp_type = _text(root.find("BFLampType"))
     meta.objective = _text(root.find("Objective"))
 
-    # --- Scan profile fields ---
     sp = root.find("ScanProfile")
     if sp is not None:
         _nested = sp.find("root")
@@ -799,32 +1051,28 @@ def parse_qpi_xml(
         meta.is_tma = _bool(sp_root.find("SampleIsTMA"))
         meta.opal_kit_type = _text(sp_root.find("OpalKitType"))
 
-    # --- Pixel size / objective ---
     meta.scan_resolution = _parse_scan_resolution(root)
 
-    # --- Camera ---
     meta.camera = _parse_camera(root)
 
-    # --- Exposure times ---
     exposure_times = _parse_exposure_times(root)
 
-    # --- Detect format and parse channels conditionally ---
     fmt = _detect_format(root, meta.scan_mode or "", meta.bf_lamp_type)
     meta.acquisition_format = fmt
     log.debug("Detected QPTIFF format: %s (slide=%s)", fmt, meta.slide_id)
 
     if fmt == FORMAT_BRIGHTFIELD:
-        # Brightfield H&E / IHC: R/G/B samples stored in the S dimension.
+        # brightfield H&E / IHC: R/G/B samples stored in the S dimension.
         n = n_channels if n_channels and n_channels > 0 else 3
         meta.channels = _parse_brightfield_channels(n)
 
     elif fmt == FORMAT_POLARIS_SCANBAND:
-        # Older Vectra/Polaris/OPAL: channel info in <ScanBands-i> XML elements.
+        # older Vectra/Polaris/OPAL: channel info in <ScanBands-i> XML elements.
         meta.channels = _parse_fluorescence_channels(root, exposure_times)
 
     elif fmt == FORMAT_FUSION_PAGED:
-        # Newer Akoya Biosciences / Fusion 1.x: each TIFF page carries its own
-        # <Biomarker> tag — collect names from the per-page XML list.
+        # newer Akoya Biosciences / Fusion 1.x: each TIFF page carries its own
+        # <Biomarker> tag..
         if per_page_xmls:
             meta.channels = _parse_channels_from_per_page_xmls(per_page_xmls)
         elif n_channels and n_channels > 0:
@@ -840,7 +1088,7 @@ def parse_qpi_xml(
             ]
 
     else:
-        # Unknown format: try each strategy in sequence.
+        # unknown format: try each strategy in sequence.
         flu_channels = _parse_fluorescence_channels(root, exposure_times)
         if flu_channels:
             meta.channels = flu_channels
@@ -858,17 +1106,13 @@ def parse_qpi_xml(
                 for i in range(n_channels)
             ]
 
-    # Supplement missing exposure times where possible
+    # supplement missing exposure times where possible
     for ch in meta.channels:
         if ch.exposure_time_us is None and ch.index < len(exposure_times):
             ch.exposure_time_us = exposure_times[ch.index]
 
     return meta
 
-
-###############################################################################
-# Utility: extract XML from a TiffFile page
-###############################################################################
 
 TIFF_IMAGE_DESCRIPTION_TAG = 270
 TIFF_DATETIME_TAG = 306
@@ -888,7 +1132,7 @@ def extract_qpi_xml_from_page(page: object) -> str:
         val = tag.value
         if not isinstance(val, str) or not val:
             return ""
-        # Only return XML recognised as a QPI description
+        # only return XML recognised as a QPI description
         try:
             root = ET.fromstring(val)
             if "PerkinElmer-QPI" not in root.tag and "PerkinElmerQPI" not in root.tag:
