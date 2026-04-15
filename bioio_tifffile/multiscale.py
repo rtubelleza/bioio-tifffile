@@ -156,8 +156,16 @@ def build_datatree_from_levels(
 
     When ``pixel_size_yx_um`` is known, each level additionally carries
     physical ``y`` / ``x`` coordinates (in um, aligned to the pixel grid at
-    that level). Scale-level metadata (``scale_factors``, ``pixel_size_um``)
-    is stored on the node's attrs for quick access.
+    that level).
+
+    Attribute placement:
+
+    - Image-global metadata (``base_attrs``) goes on the root DataTree
+      attrs — it applies to every scale identically.
+    - Per-level metadata (``level``, ``scale_factors``, ``pixel_size_um``)
+      goes on the ``image`` DataArray's attrs, not on the Dataset or node
+      wrapping it. This keeps all scale-varying info travelling with the
+      array when callers slice out a single level.
     """
     if not levels_arrays:
         raise ValueError("levels_arrays must contain at least one level")
@@ -179,7 +187,7 @@ def build_datatree_from_levels(
 
         # physical y / x coordinates at this level. Spacing varies per level
         # and is what distinguishes scale0 (fine) from scaleN (coarse) in
-        # physical units. When pixxel size is unknown we leave y / x without
+        # physical units. When pixel size is unknown we leave y / x without
         coords_spatial: typing.Dict[str, typing.Any] = {}
         if pixel_size_yx_um is not None and "pixel_size_um" in scale_attrs:
             py_um, px_um = scale_attrs["pixel_size_um"]
@@ -196,13 +204,15 @@ def build_datatree_from_levels(
 
         all_coords = {**coords_base, **coords_spatial}
         arr_with_coords = arr.assign_coords(all_coords) if all_coords else arr
-        ds = xr.Dataset(
-            data_vars={"image": arr_with_coords},
-            attrs={**clean_base, **scale_attrs},
-        )
+        # per-level attrs live on the DataArray so they ride with a sliced
+        # `.image` and don't pollute the Dataset node attrs.
+        arr_with_coords.attrs = {**arr_with_coords.attrs, **scale_attrs}
+        ds = xr.Dataset(data_vars={"image": arr_with_coords})
         datasets[f"scale{i}"] = xr.DataTree(dataset=ds)
 
     dt = xr.DataTree(children=datasets)
+    # image-global attrs belong on the root, not repeated per scale node
+    dt.attrs = clean_base
     _validate_multiscale_spec(dt)
     return dt
 

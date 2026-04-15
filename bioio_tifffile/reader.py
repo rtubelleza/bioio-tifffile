@@ -206,17 +206,28 @@ class Reader(reader.Reader):
         if self._physical_pixel_sizes is None:
             tiff_series_idx = self._tiff_series_index(self.current_scene_index)
             meta = self.qpi_metadata
+            tiff_z = tiff_y = tiff_x = None
+            with self._fs.open(self._path) as open_resource:
+                try:
+                    tiff_z, tiff_y, tiff_x = _get_pixel_size(
+                        open_resource, tiff_series_idx
+                    )
+                except Exception as exc:
+                    warnings.warn(f"Could not parse QPTIFF pixel size: {exc}")
             if meta.pixel_size_um is not None:
                 px = meta.pixel_size_um
+                # warn if TIFF resolution tags disagree with the XML by >1%.
+                for axis, tiff_val in (("Y", tiff_y), ("X", tiff_x)):
+                    if tiff_val is not None and abs(tiff_val - px) > 0.01 * px:
+                        warnings.warn(
+                            f"QPTIFF pixel size mismatch on {axis}: XML={px}um, "
+                            f"TIFF tag={tiff_val}um; using XML value."
+                        )
                 self._physical_pixel_sizes = types.PhysicalPixelSizes(None, px, px)
             else:
-                with self._fs.open(self._path) as open_resource:
-                    try:
-                        z, y, x = _get_pixel_size(open_resource, tiff_series_idx)
-                    except Exception as exc:
-                        warnings.warn(f"Could not parse QPTIFF pixel size: {exc}")
-                        z, y, x = None, None, None
-                self._physical_pixel_sizes = types.PhysicalPixelSizes(z, y, x)
+                self._physical_pixel_sizes = types.PhysicalPixelSizes(
+                    tiff_z, tiff_y, tiff_x
+                )
         return self._physical_pixel_sizes
 
     @staticmethod

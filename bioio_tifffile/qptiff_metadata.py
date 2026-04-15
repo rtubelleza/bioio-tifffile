@@ -10,6 +10,7 @@ produced by PerkinElmer Vectra/Polaris/Fusion/CODEX instruments.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import xml.etree.ElementTree as ET
@@ -33,6 +34,87 @@ FORMAT_FUSION_PAGED = "fusion_paged"
 #: No recognised structural signals. Parser will try strategies in order.
 FORMAT_UNKNOWN = "unknown"
 
+@dataclass
+class ScanResolutionInfo:
+    """Objective / scan-profile settings that apply to the whole scene.
+
+    ``base_pixel_size_um`` is the physical pixel size of the full resolution tile.
+    """
+    magnification: Optional[float] = None
+    objective_name: Optional[str] = None
+    binning: Optional[int] = None
+    base_pixel_size_um: Optional[float] = None
+
+@dataclass
+class CameraInfo:
+    """Camera / detector settings for the whole scene.
+
+    Fusion 1.x embeds ``<CameraSettings>`` in every page XML; in practice the
+    values are identical across channels, so these live at the image scope.
+    
+    If a file does genuinely vary per channel the parser warns and keeps the
+    varying copy on :class:`ChannelInfo`.
+    """
+    camera_name: Optional[str] = None
+    camera_type: Optional[str] = None
+    gain: Optional[float] = None
+    bit_depth: Optional[int] = None
+    binning: Optional[int] = None
+    offset_counts: Optional[int] = None
+    orientation: Optional[str] = None
+    roi_x: Optional[int] = None
+    roi_y: Optional[int] = None
+    roi_width: Optional[int] = None
+    roi_height: Optional[int] = None
+
+
+@dataclass
+class SlideInfo:
+    """Physical-slide identity. Constant across every image on the slide.
+
+    Surfaced on each image's root DataTree attrs (with a ``slide:`` prefix) so
+    detached NGFF groups remain independently interpretable.
+    """
+    slide_id: Optional[str] = None
+    barcode: Optional[str] = None
+    study_name: Optional[str] = None
+    operator_name: Optional[str] = None
+    computer_name: Optional[str] = None
+    datetime: Optional[str] = None  # TIFF tag 306
+    acquisition_software: Optional[str] = None
+    description_version: Optional[str] = None
+    instrument_type: Optional[str] = None
+    identifier: Optional[str] = None  # slide-level UUID
+
+
+@dataclass
+class ImageInfo:
+    """Metadata for a given image scene.
+
+    For qptiffs;
+        - FullResolution
+        - Thumbnail
+        - Macro
+        - Label
+
+    One ``ImageInfo`` per distinct image (FullResolution / Label / Macro /
+    Thumbnail). Dumped flat into that image's root ``DataTree.attrs``.
+    """
+    image_type: Optional[str] = None  # FullResolution / Thumbnail / Macro / Label
+    # optics / acquisition
+    objective: Optional[str] = None
+    bf_lamp_type: Optional[str] = None
+    scan_profile_name: Optional[str] = None
+    scan_mode: Optional[str] = None
+    is_tma: Optional[bool] = None
+    opal_kit_type: Optional[str] = None
+    # stage position of this image
+    xposition_um: Optional[float] = None
+    yposition_um: Optional[float] = None
+    # nested per-image blocks
+    camera: CameraInfo = field(default_factory=CameraInfo)
+    scan_resolution: ScanResolutionInfo = field(default_factory=ScanResolutionInfo)
+
 
 @dataclass
 class ChannelInfo:
@@ -40,12 +122,12 @@ class ChannelInfo:
 
     Attempt to standardise incoming qptiff metadata fields here for ome_metadata compatability
     as well.
+
+    This defines variables along the "c"/"channel" axis.
     """
 
     index: int
-    name: (
-        str  # biomarker / stain or fluorophore name, or rgb for brightfield, H&E, etc.
-    )
+    name: str  # biomarker / stain or fluorophore name / rgb for birghtfield/he
     fluorophore: Optional[str] = None
     # ExposureTime in the PerkinElmer spec is in microseconds
     exposure_time_us: Optional[float] = None
@@ -63,7 +145,6 @@ class ChannelInfo:
     binning: Optional[int] = None
     # Additional per-channel fields present in Fusion 1.x page XMLs
     objective: Optional[str] = None
-    scale_factor: Optional[float] = None
     autofluorescence_subtracted: Optional[bool] = None
     responsivity: Optional[float] = None
     responsivity_filter_id: Optional[str] = None
@@ -83,6 +164,16 @@ class ChannelInfo:
     roi_width: Optional[int] = None
     roi_height: Optional[int] = None
 
+
+@dataclass
+class ScaleInfo:
+    """Image metadata which changes with pyramidal scale. """
+    level: int
+    scale_factor: Optional[float] = None # ds factor relative to full
+    # physical pixel size in micrometres; 
+    # this can be implicitly found by scale_factor * base_pixel_size_um, 
+    # but denormalise here for convenience
+    pixel_size_um: Optional[float] = None  
 
 def _format_color(c: Optional[Tuple[int, int, int]]) -> Optional[str]:
     return f"{c[0]},{c[1]},{c[2]}" if c else None
@@ -135,91 +226,128 @@ CHANNEL_COORD_SCHEMA: List[Tuple[str, str, Optional[object]]] = [
 
 
 @dataclass
-class ScanResolutionInfo:
-    """Pixel size and objective information from the scan profile."""
+class QptiffImageScene:
+    """One logical image from a QPTIFF (FullRes / Label / Macro / Thumbnail).
 
-    pixel_size_um: Optional[float] = None  # physical pixel size in micrometres
-    magnification: Optional[float] = None
-    objective_name: Optional[str] = None
-    binning: Optional[int] = None
+    Metadata-only. Pixel data is attached by the reader when building the
+    per-scene DataTree.
+    """
+    image_info: ImageInfo = field(default_factory=ImageInfo)
+    channels: List[ChannelInfo] = field(default_factory=list)  # [] for Label/Macro
+    scales: List[ScaleInfo] = field(default_factory=list)       # len 1 if not pyramidal
+    raw_xml: str = ""
 
+    @property
+    def image_type(self) -> Optional[str]:
+        return self.image_info.image_type
 
-@dataclass
-class CameraInfo:
-    """Camera / detector settings."""
+    @property
+    def is_pyramidal(self) -> bool:
+        return len(self.scales) > 1
 
-    camera_name: Optional[str] = None
-    camera_type: Optional[str] = None
-    gain: Optional[float] = None
-    bit_depth: Optional[int] = None
-    binning: Optional[int] = None
+    @property
+    def channel_names(self) -> List[str]:
+        return [ch.name for ch in self.channels]
+
+    @property
+    def is_brightfield(self) -> bool:
+        sm = self.image_info.scan_mode
+        return any(ch.is_brightfield for ch in self.channels) or (
+            sm is not None and "Brightfield" in sm
+        )
 
 
 @dataclass
 class QptiffMetadata:
     """
-    Structured metadata extracted from a PerkinElmer QPI QPTIFF file.
+    Structured metadata extracted from a PerkinElmer QPI QPTIFF file,
+    across each image scenes, dimensions and scales (if multiscale).
 
-    All fields are optional and populated only when the corresponding XML
-    element is present in the file.
+    ``slide`` holds fields constant across every image on the slide.
+    ``images`` holds one :class:`QptiffImageScene` per distinct image (the
+    main FullResolution scan plus any Label / Macro / Thumbnail siblings).
+
     """
-
-    # file acquisition
-    description_version: Optional[str] = None
-    acquisition_software: Optional[str] = None
-    image_type: Optional[str] = None  # "FullResolution", "Thumbnail", "Macro", "Label"
-    identifier: Optional[str] = None  # UUID
-    slide_id: Optional[str] = None
-    barcode: Optional[str] = None
-    study_name: Optional[str] = None
-    operator_name: Optional[str] = None
-    computer_name: Optional[str] = None
-    datetime: Optional[str] = None  # from TIFF tag 306
-
-    # intstruemnt
-    instrument_type: Optional[str] = None
-    bf_lamp_type: Optional[str] = None
-    objective: Optional[str] = None
-    scan_profile_name: Optional[str] = None  # e.g. "Brightfield_TMA"
-    scan_mode: Optional[str] = None  # e.g. "im_Brightfield"
-    is_tma: Optional[bool] = None
-    opal_kit_type: Optional[str] = None
-
-    # camera
-    camera: CameraInfo = field(default_factory=CameraInfo)
-
-    # pixel res
-    scan_resolution: ScanResolutionInfo = field(default_factory=ScanResolutionInfo)
-
-    # tiff x/y position tags
-    xposition_um: Optional[float] = None
-    yposition_um: Optional[float] = None
-
-    # channels
-    channels: List[ChannelInfo] = field(default_factory=list)
-
-    # detected format
+    slide: SlideInfo = field(default_factory=SlideInfo)
+    images: List[QptiffImageScene] = field(default_factory=list)
     acquisition_format: Optional[str] = None  # one of the FORMAT_* constants
-
-    # raw
     raw_xml: str = ""
 
     @property
+    def full_resolution(self) -> Optional[QptiffImageScene]:
+        return next(
+            (im for im in self.images if im.image_type == "FullResolution"),
+            None,
+        )
+
+    def by_type(self, image_type: str) -> Optional[QptiffImageScene]:
+        return next(
+            (im for im in self.images if im.image_type == image_type),
+            None,
+        )
+
+    @property
+    def _primary(self) -> QptiffImageScene:
+        """Image used by back-compat accessors — FullRes if present else first."""
+        return self.full_resolution or (self.images[0] if self.images else QptiffImageScene())
+
+    @property
+    def slide_id(self) -> Optional[str]: return self.slide.slide_id
+    @property
+    def barcode(self) -> Optional[str]: return self.slide.barcode
+    @property
+    def study_name(self) -> Optional[str]: return self.slide.study_name
+    @property
+    def operator_name(self) -> Optional[str]: return self.slide.operator_name
+    @property
+    def computer_name(self) -> Optional[str]: return self.slide.computer_name
+    @property
+    def datetime(self) -> Optional[str]: return self.slide.datetime
+    @property
+    def acquisition_software(self) -> Optional[str]: return self.slide.acquisition_software
+    @property
+    def description_version(self) -> Optional[str]: return self.slide.description_version
+    @property
+    def instrument_type(self) -> Optional[str]: return self.slide.instrument_type
+    @property
+    def identifier(self) -> Optional[str]: return self.slide.identifier
+    @property
+    def image_type(self) -> Optional[str]: return self._primary.image_info.image_type
+    @property
+    def objective(self) -> Optional[str]: return self._primary.image_info.objective
+    @property
+    def bf_lamp_type(self) -> Optional[str]: return self._primary.image_info.bf_lamp_type
+    @property
+    def scan_profile_name(self) -> Optional[str]: return self._primary.image_info.scan_profile_name
+    @property
+    def scan_mode(self) -> Optional[str]: return self._primary.image_info.scan_mode
+    @property
+    def is_tma(self) -> Optional[bool]: return self._primary.image_info.is_tma
+    @property
+    def opal_kit_type(self) -> Optional[str]: return self._primary.image_info.opal_kit_type
+    @property
+    def xposition_um(self) -> Optional[float]: return self._primary.image_info.xposition_um
+    @property
+    def yposition_um(self) -> Optional[float]: return self._primary.image_info.yposition_um
+    @property
+    def camera(self) -> CameraInfo: return self._primary.image_info.camera
+    @property
+    def scan_resolution(self) -> ScanResolutionInfo: return self._primary.image_info.scan_resolution
+
+    @property
+    def channels(self) -> List[ChannelInfo]: return self._primary.channels
+
+    @property
     def pixel_size_um(self) -> Optional[float]:
-        """Pixels per um"""
-        return self.scan_resolution.pixel_size_um
+        return self._primary.image_info.scan_resolution.base_pixel_size_um
 
     @property
     def channel_names(self) -> List[str]:
-        """Ordered list of channel names."""
-        return [ch.name for ch in self.channels]
+        return self._primary.channel_names
 
     @property
     def is_brightfield(self) -> bool:
-        """True when the image is a brightfield (H&E / IHC) scan."""
-        return any(ch.is_brightfield for ch in self.channels) or (
-            self.scan_mode is not None and "Brightfield" in self.scan_mode
-        )
+        return self._primary.is_brightfield
 
     def to_dict(self, *, ome_only: bool = False) -> Dict:
         """
@@ -317,7 +445,7 @@ class QptiffMetadata:
         }
 
 
-def _ome_color(rgb: Optional[Tuple[int, int, int]]) -> Optional["Color"]:
+def _ome_color(rgb: Optional[Tuple[int, int, int]]) -> Optional[object]:
     if rgb is None:
         return None
     try:
@@ -332,6 +460,27 @@ def _str(v: object) -> Optional[str]:
     return str(v) if v is not None else None
 
 
+_TIFF_DATETIME_RE = re.compile(
+    r"^(\d{4}):(\d{2}):(\d{2})[ T](\d{2}:\d{2}:\d{2}(?:\.\d+)?)"
+)
+
+
+def _tiff_datetime_to_iso(dt: Optional[str]) -> Optional[str]:
+    """Convert a TIFF DateTime string ("YYYY:MM:DD HH:MM:SS") to ISO 8601.
+
+    Pydantic's datetime validator rejects the colon-separated date form used
+    by the TIFF spec. Pass-through any value that already parses (ISO, with
+    timezone, etc.).
+    """
+    if not dt:
+        return dt
+    m = _TIFF_DATETIME_RE.match(dt.strip())
+    if m is None:
+        return dt
+    y, mo, d, t = m.groups()
+    return f"{y}-{mo}-{d}T{t}"
+
+
 def ome_metadata_from_qptiff(
     qpi: "QptiffMetadata",
     scene_name: Optional[str] = None,
@@ -340,7 +489,7 @@ def ome_metadata_from_qptiff(
     size_z: Optional[int] = None,
     size_c: Optional[int] = None,
     size_t: Optional[int] = None,
-) -> "OME":
+) -> object:
     """
     Map a :class:`QptiffMetadata` to a fully typed :class:`ome_types.model.OME`
     object.
@@ -602,7 +751,7 @@ def ome_metadata_from_qptiff(
     image = Image(
         id=image_id,
         name=scene_name,
-        acquisition_date=qpi.datetime,
+        acquisition_date=_tiff_datetime_to_iso(qpi.datetime),
         instrument_ref=InstrumentRef(id=instrument_id),
         objective_settings=ObjectiveSettings(id=objective_id) if objective else None,
         experimenter_ref=ExperimenterRef(id=experimenter_id) if experimenter else None,
@@ -707,7 +856,7 @@ def _parse_scan_resolution(root: ET.Element) -> ScanResolutionInfo:
     binning = _int(sr.find("Binning"))
 
     return ScanResolutionInfo(
-        pixel_size_um=pixel_size,
+        base_pixel_size_um=pixel_size,
         magnification=magnification,
         objective_name=objective_name,
         binning=binning,
@@ -856,15 +1005,17 @@ def _populate_channel_fields_from_element(
         except ValueError:
             pass
 
-    # emission / excitation wavelengths
-    em_band = elem.find(".//EmissionFilter/Bands/Band")
+    # emission / excitation wavelengths. Filters may list multiple bands (one
+    # per channel); prefer the one flagged <Active>true</Active>, else the
+    # first band.
+    em_band = _select_active_band(elem.find(".//EmissionFilter"))
     if em_band is not None:
         cuton = _float(em_band.find("Cuton"))
         cutoff = _float(em_band.find("Cutoff"))
         if cuton is not None and cutoff is not None:
             fields["emission_wavelength_nm"] = (cuton + cutoff) / 2.0
 
-    ex_band = elem.find(".//ExcitationFilter/Bands/Band")
+    ex_band = _select_active_band(elem.find(".//ExcitationFilter"))
     if ex_band is not None:
         cuton = _float(ex_band.find("Cuton"))
         cutoff = _float(ex_band.find("Cutoff"))
@@ -951,6 +1102,64 @@ def _populate_channel_fields_from_element(
         _set_if(fields, "binning", _int(elem.find(".//Binning")))
 
 
+def _select_active_band(
+    filter_elem: Optional[ET.Element],
+) -> Optional[ET.Element]:
+    """Return the <Band> flagged <Active>true</Active>, else the first band.
+
+    Fusion 1.x per-page XMLs list every band of the multi-band filter; only one
+    is marked active for that channel. Older formats omit <Active> entirely, so
+    we fall back to the first band to preserve prior behaviour.
+    """
+    if filter_elem is None:
+        return None
+    bands = filter_elem.findall("Bands/Band")
+    if not bands:
+        return None
+    for b in bands:
+        active = b.find("Active")
+        if active is not None and active.text and active.text.strip().lower() in (
+            "true",
+            "1",
+            "yes",
+        ):
+            return b
+    return bands[0]
+
+
+def _parse_scan_profile_json(
+    image_info: ImageInfo, scan_profile_text: str
+) -> None:
+    """Pull structured fields out of a Fusion 1.x JSON ScanProfile.
+
+    Fusion stores ScanProfile as a JSON blob rather than nested XML. Extract
+    the fields that map onto existing ImageInfo slots; leave the rest for
+    callers who parse ``raw_xml`` themselves.
+    """
+    try:
+        sp = json.loads(scan_profile_text)
+    except (ValueError, TypeError) as exc:
+        log.debug("ScanProfile JSON parse failed: %s", exc)
+        return
+    if not isinstance(sp, dict):
+        return
+
+    if image_info.is_tma is None and isinstance(sp.get("isTma"), bool):
+        image_info.is_tma = sp["isTma"]
+
+    if image_info.scan_resolution.binning is None:
+        binning = sp.get("binning")
+        if isinstance(binning, int):
+            image_info.scan_resolution.binning = binning
+
+    exp = sp.get("experimentDescription")
+    if isinstance(exp, dict):
+        if image_info.scan_profile_name is None:
+            name = exp.get("name")
+            if isinstance(name, str) and name:
+                image_info.scan_profile_name = name
+
+
 def _set_if(target: Dict[str, object], key: str, value: object) -> None:
     """Write ``value`` into ``target[key]`` only when it is not None."""
     if value is not None:
@@ -1014,69 +1223,82 @@ def parse_qpi_xml(
     QptiffMetadata
         Fully populated (where data is available) metadata object.
     """
-    meta = QptiffMetadata(raw_xml=xml_string, datetime=datetime_str)
+    slide = SlideInfo(datetime=datetime_str)
+    image_info = ImageInfo()
+    channels: List[ChannelInfo] = []
 
     if not xml_string:
-        return meta
+        return QptiffMetadata(
+            slide=slide,
+            images=[QptiffImageScene(image_info=image_info, raw_xml=xml_string)],
+            raw_xml=xml_string,
+        )
 
     try:
         root = ET.fromstring(xml_string)
     except ET.ParseError as exc:
         log.warning("Failed to parse QPI XML: %s", exc)
-        return meta
+        return QptiffMetadata(
+            slide=slide,
+            images=[QptiffImageScene(image_info=image_info, raw_xml=xml_string)],
+            raw_xml=xml_string,
+        )
 
-    # validate root tag
     if "PerkinElmer-QPI" not in root.tag and "PerkinElmerQPI" not in root.tag:
         log.debug("XML root %r not a recognised QPI description", root.tag)
 
-    meta.description_version = _text(root.find("DescriptionVersion"))
-    meta.acquisition_software = _text(root.find("AcquisitionSoftware"))
-    meta.image_type = _text(root.find("ImageType"))
-    meta.identifier = _text(root.find("Identifier"))
-    meta.slide_id = _text(root.find("SlideID"))
-    meta.barcode = _text(root.find("Barcode")) or None
-    meta.study_name = _text(root.find("StudyName"))
-    meta.operator_name = _text(root.find("OperatorName"))
-    meta.computer_name = _text(root.find("ComputerName"))
-    meta.instrument_type = _text(root.find("InstrumentType"))
-    meta.bf_lamp_type = _text(root.find("BFLampType"))
-    meta.objective = _text(root.find("Objective"))
+    # slide-scope fields
+    slide.description_version = _text(root.find("DescriptionVersion"))
+    slide.acquisition_software = _text(root.find("AcquisitionSoftware"))
+    slide.identifier = _text(root.find("Identifier"))
+    slide.slide_id = _text(root.find("SlideID"))
+    slide.barcode = _text(root.find("Barcode")) or None
+    slide.study_name = _text(root.find("StudyName"))
+    slide.operator_name = _text(root.find("OperatorName"))
+    slide.computer_name = _text(root.find("ComputerName"))
+    slide.instrument_type = _text(root.find("InstrumentType"))
+
+    # image-scope fields
+    image_info.image_type = _text(root.find("ImageType"))
+    image_info.bf_lamp_type = _text(root.find("BFLampType"))
+    image_info.objective = _text(root.find("Objective"))
 
     sp = root.find("ScanProfile")
     if sp is not None:
         _nested = sp.find("root")
         sp_root = _nested if _nested is not None else sp
-        meta.scan_profile_name = _text(sp_root.find("Name"))
-        meta.scan_mode = _text(sp_root.find("Mode"))
-        meta.is_tma = _bool(sp_root.find("SampleIsTMA"))
-        meta.opal_kit_type = _text(sp_root.find("OpalKitType"))
+        image_info.scan_profile_name = _text(sp_root.find("Name"))
+        image_info.scan_mode = _text(sp_root.find("Mode"))
+        image_info.is_tma = _bool(sp_root.find("SampleIsTMA"))
+        image_info.opal_kit_type = _text(sp_root.find("OpalKitType"))
 
-    meta.scan_resolution = _parse_scan_resolution(root)
+    image_info.scan_resolution = _parse_scan_resolution(root)
 
-    meta.camera = _parse_camera(root)
+    # Fusion 1.x stores ScanProfile as a JSON blob; fill any still-missing
+    # fields from it. Done after _parse_scan_resolution so the XML-form values
+    # take priority.
+    if sp is not None and sp.text and sp.text.strip().startswith("{"):
+        _parse_scan_profile_json(image_info, sp.text)
+
+    image_info.camera = _parse_camera(root)
 
     exposure_times = _parse_exposure_times(root)
 
-    fmt = _detect_format(root, meta.scan_mode or "", meta.bf_lamp_type)
-    meta.acquisition_format = fmt
-    log.debug("Detected QPTIFF format: %s (slide=%s)", fmt, meta.slide_id)
+    fmt = _detect_format(root, image_info.scan_mode or "", image_info.bf_lamp_type)
+    log.debug("Detected QPTIFF format: %s (slide=%s)", fmt, slide.slide_id)
 
     if fmt == FORMAT_BRIGHTFIELD:
-        # brightfield H&E / IHC: R/G/B samples stored in the S dimension.
         n = n_channels if n_channels and n_channels > 0 else 3
-        meta.channels = _parse_brightfield_channels(n)
+        channels = _parse_brightfield_channels(n)
 
     elif fmt == FORMAT_POLARIS_SCANBAND:
-        # older Vectra/Polaris/OPAL: channel info in <ScanBands-i> XML elements.
-        meta.channels = _parse_fluorescence_channels(root, exposure_times)
+        channels = _parse_fluorescence_channels(root, exposure_times)
 
     elif fmt == FORMAT_FUSION_PAGED:
-        # newer Akoya Biosciences / Fusion 1.x: each TIFF page carries its own
-        # <Biomarker> tag..
         if per_page_xmls:
-            meta.channels = _parse_channels_from_per_page_xmls(per_page_xmls)
+            channels = _parse_channels_from_per_page_xmls(per_page_xmls)
         elif n_channels and n_channels > 0:
-            meta.channels = [
+            channels = [
                 ChannelInfo(
                     index=i,
                     name=f"Channel_{i}",
@@ -1088,14 +1310,13 @@ def parse_qpi_xml(
             ]
 
     else:
-        # unknown format: try each strategy in sequence.
         flu_channels = _parse_fluorescence_channels(root, exposure_times)
         if flu_channels:
-            meta.channels = flu_channels
+            channels = flu_channels
         elif per_page_xmls:
-            meta.channels = _parse_channels_from_per_page_xmls(per_page_xmls)
+            channels = _parse_channels_from_per_page_xmls(per_page_xmls)
         elif n_channels and n_channels > 0:
-            meta.channels = [
+            channels = [
                 ChannelInfo(
                     index=i,
                     name=f"Channel_{i}",
@@ -1107,11 +1328,21 @@ def parse_qpi_xml(
             ]
 
     # supplement missing exposure times where possible
-    for ch in meta.channels:
+    for ch in channels:
         if ch.exposure_time_us is None and ch.index < len(exposure_times):
             ch.exposure_time_us = exposure_times[ch.index]
 
-    return meta
+    image = QptiffImageScene(
+        image_info=image_info,
+        channels=channels,
+        raw_xml=xml_string,
+    )
+    return QptiffMetadata(
+        slide=slide,
+        images=[image],
+        acquisition_format=fmt,
+        raw_xml=xml_string,
+    )
 
 
 TIFF_IMAGE_DESCRIPTION_TAG = 270
