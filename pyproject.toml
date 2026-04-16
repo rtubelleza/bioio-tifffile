@@ -37,6 +37,7 @@ dependencies = [
   "multiscale-spatial-image==2.0.3", # multiscale qptiff support
   "numpy>=1.16",
   "ome-types>=0.5.0", # qptiff ome metadata support
+  "ome-zarr-models-py>=1.6.0", # OME-NGFF v0.5 .zattrs construction
   "tifffile[zarr]>=2023.7.10",
   "xarray>=2024.10",
 ]

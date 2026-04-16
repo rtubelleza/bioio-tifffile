@@ -29,12 +29,14 @@ from .qptiff_metadata import (
     ome_to_channel_coords,
     ome_to_flat_attrs,
 )
+from .qptiff_zarr import write_ome_zarr
 from .reader import Reader
 from .reader_metadata import ReaderMetadata
 
 __all__ = [
     "Reader",
     "ReaderMetadata",
+    "write_ome_zarr",
     "QptiffMetadata",
     "ChannelInfo",
     "ScanResolutionInfo",

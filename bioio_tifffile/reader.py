@@ -19,6 +19,7 @@ from tifffile import TiffFile, imread
 from tifffile.tifffile import TiffTags
 
 from .multiscale import build_datatree_from_levels, squeeze_to_cyx
+from .qptiff_zarr import write_ome_zarr as _write_ome_zarr
 from .qptiff_metadata import (
     QptiffMetadata,
     extract_datetime_from_page,
@@ -86,6 +87,9 @@ class Reader(reader.Reader):
     _scene_level_map: typing.Optional[typing.Dict[int, int]] = None
     # qptiff: parsed XML metadata per tifffile series index
     _qpi_meta_cache: typing.Dict[int, QptiffMetadata]
+    # qptiff: OME object per tifffile series index (avoids double-parse when
+    # write_ome_zarr calls both xarray_dask_datatree_data and ome_metadata)
+    _ome_cache: typing.Dict[int, object]
 
     @staticmethod
     def _is_supported_image(
@@ -161,6 +165,7 @@ class Reader(reader.Reader):
             kwargs.get("ome_metadata", _rk.get("ome_metadata", False))
         )
         self._qpi_meta_cache = {}
+        self._ome_cache = {}
 
         # Enforce valid image
         self._is_supported_image(self._fs, self._path)
@@ -865,8 +870,11 @@ class Reader(reader.Reader):
         For non-QPTIFF files the Pixels element is populated from TIFF
         resolution tags alone and the channel list will be empty.
         """
-        qpi = self.qpi_metadata
         tiff_series_idx = self._tiff_series_index(self.current_scene_index)
+        if tiff_series_idx in self._ome_cache:
+            return self._ome_cache[tiff_series_idx]  # type: ignore[return-value]
+
+        qpi = self.qpi_metadata
         level_idx = self._tiff_level_index(self.current_scene_index)
 
         with self._fs.open(self._path) as open_resource:
@@ -876,7 +884,7 @@ class Reader(reader.Reader):
                 shape = level_series.shape
 
         shape_map = dict(zip(axes.upper(), shape))
-        return ome_metadata_from_qptiff(
+        ome = ome_metadata_from_qptiff(
             qpi=qpi,
             scene_name=self.scenes[self.current_scene_index],
             size_x=shape_map.get("X"),
@@ -885,6 +893,8 @@ class Reader(reader.Reader):
             size_c=shape_map.get("C", shape_map.get("S")),
             size_t=shape_map.get("T"),
         )
+        self._ome_cache[tiff_series_idx] = ome
+        return ome
 
     # qptiff
     @property
@@ -927,7 +937,22 @@ class Reader(reader.Reader):
         if valid_qpi_series(series.pages):
             meta = self._get_or_parse_meta(tiff_series_idx, series)
             base_attrs = self._build_attrs(self._get_tiff_tags(tiff), meta, series)
-            ome_obj = ome_metadata_from_qptiff(meta)
+            if tiff_series_idx in self._ome_cache:
+                ome_obj = self._ome_cache[tiff_series_idx]
+            else:
+                level0 = series.levels[0]
+                axes0 = getattr(level0, "axes", "")
+                shape_map0 = dict(zip(axes0.upper(), level0.shape))
+                ome_obj = ome_metadata_from_qptiff(
+                    meta,
+                    scene_name=self.scenes[self.current_scene_index],
+                    size_x=shape_map0.get("X"),
+                    size_y=shape_map0.get("Y"),
+                    size_z=shape_map0.get("Z"),
+                    size_c=shape_map0.get("C", shape_map0.get("S")),
+                    size_t=shape_map0.get("T"),
+                )
+                self._ome_cache[tiff_series_idx] = ome_obj
         else:
             tiff_tags = self._get_tiff_tags(tiff)
             try:
@@ -1012,6 +1037,52 @@ class Reader(reader.Reader):
             attrs["qpi_pyramid_level_count"] = n_levels
             attrs["qpi_is_pyramidal"] = n_levels > 1
         return attrs
+
+    # qptiff
+    def write_ome_zarr(
+        self,
+        store: typing.Union[str, "typing.MutableMapping[str, typing.Any]"],
+        *,
+        overwrite: bool = False,
+        ome_only: typing.Optional[bool] = None,
+        validate: bool = True,
+        **kwargs: typing.Any,
+    ) -> "typing.Any":
+        """
+        Write the current scene's multiscale pyramid to an OME-NGFF v0.5 zarr store.
+
+        Convenience wrapper around :func:`~bioio_tifffile.qptiff_zarr.write_ome_zarr`.
+
+        Parameters
+        ----------
+        store:
+            Output path (str) or zarr MutableMapping.
+        overwrite:
+            Replace an existing store if True. Default: False.
+        ome_only:
+            Omit QPI vendor fields from the output. Defaults to the reader's
+            ``ome_metadata`` constructor flag.
+        validate:
+            Validate the written store against OME-NGFF v0.5 spec. Default: True.
+        **kwargs:
+            Forwarded to :func:`~bioio_tifffile.qptiff_zarr.write_ome_zarr`
+            (e.g. ``chunk_shape``, ``shard_shape``, ``compressor``,
+            ``zarr_format``).
+
+        Returns
+        -------
+        zarr.Group
+            Root group of the written store.
+        """
+        return _write_ome_zarr(
+            self.xarray_dask_datatree_data,
+            self.ome_metadata,
+            store,
+            overwrite=overwrite,
+            ome_only=ome_only if ome_only is not None else self._ome_only,
+            validate=validate,
+            **kwargs,
+        )
 
 
 _NAME_TO_MICRONS = {

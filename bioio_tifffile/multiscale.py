@@ -7,7 +7,7 @@ Helpers for building multiscale xarray.DataTree pyramids from QPTIFF data.
     └── ...
 
 Every scale node carries the same per-channel coordinates and an attrs dict
-with `scale_factors`, `pixel_size_um`, and `level`.
+with `level`, `dims`, `scale_factors`, and `pixel_size_um`.
 """
 
 from __future__ import annotations
@@ -68,6 +68,7 @@ def compute_scale_attrs(
 
     attrs: typing.Dict[str, typing.Any] = {
         "level": level_idx,
+        "dims": ["y", "x"],
         "scale_factors": [sy, sx],
     }
     if pixel_size_yx_um is not None:
