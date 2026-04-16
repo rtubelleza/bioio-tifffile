@@ -18,7 +18,8 @@ import multiscale_spatial_image  # registers the .msi accessor on xr.DataTree
 import numpy as np
 import xarray as xr
 
-from .qptiff_metadata import CHANNEL_COORD_SCHEMA, ChannelInfo
+from .qptiff_metadata import ChannelInfo
+from .qptiff_ome import ome_to_channel_coords
 
 _UPPER_TO_LOWER = {"C": "c", "S": "c", "Y": "y", "X": "x", "Z": "z", "T": "t"}
 
@@ -75,47 +76,6 @@ def compute_scale_attrs(
     return attrs
 
 
-def channel_coord_dict(
-    channel_names: typing.Optional[typing.List[str]],
-    channel_infos: typing.Optional[typing.List[ChannelInfo]],
-    channel_dim: str = "c",
-    ome_only: bool = False,
-) -> typing.Dict[str, typing.Any]:
-    """
-    Build the coords dict attaching per-channel OME-style metadata to a
-    channel axis. Returns an empty dict when no channel info is available.
-
-    Keys are emitted from :data:`CHANNEL_COORD_SCHEMA` so the set of keys
-    stays in lockstep with the flat attrs emitted by
-    :meth:`QptiffMetadata.to_dict`. Keys follow OME-XML field naming
-    (``Channel:Fluor``, ``Plane:ExposureTime``, ``DetectorSettings:Gain``,
-    ...); QPTIFF-specific fields with no OME equivalent use a ``qpi_``
-    prefix.
-    """
-    coords: typing.Dict[str, typing.Any] = {}
-    if not channel_names:
-        return coords
-    coords[channel_dim] = list(channel_names)
-
-    if not channel_infos:
-        return coords
-
-    n = len(channel_names)
-    infos = channel_infos[:n]
-
-    for ome_key, attr, formatter in CHANNEL_COORD_SCHEMA:
-        if ome_only and ome_key.startswith("qpi_"):
-            continue
-        raw = [getattr(ci, attr, None) for ci in infos]
-        if formatter is not None:
-            vals = [formatter(v) if v is not None else None for v in raw]
-        else:
-            vals = raw
-        if any(v is not None for v in vals):
-            coords[ome_key] = (channel_dim, vals)
-
-    return coords
-
 
 def _sanitise_attrs(
     attrs: typing.Dict[str, typing.Any],
@@ -141,10 +101,11 @@ def _sanitise_attrs(
 def build_datatree_from_levels(
     levels_arrays: typing.List[xr.DataArray],
     channel_names: typing.Optional[typing.List[str]],
-    channel_infos: typing.Optional[typing.List[ChannelInfo]],
     pixel_size_yx_um: typing.Optional[typing.Tuple[float, float]],
     base_attrs: typing.Dict[str, typing.Any],
+    channel_infos: typing.Optional[typing.List[ChannelInfo]] = None,
     ome_only: bool = False,
+    ome: typing.Optional[object] = None,
 ) -> xr.DataTree:
     """
     Assemble an xr.DataTree with `/scale0`, `/scale1`, ... children, to
@@ -175,9 +136,13 @@ def build_datatree_from_levels(
         int(levels_arrays[0].sizes.get("x", 1)),
     )
 
-    coords_base = channel_coord_dict(
-        channel_names, channel_infos, channel_dim="c", ome_only=ome_only
-    )
+    if ome is not None:
+        coords_base = ome_to_channel_coords(ome, channel_dim="c", ome_only=ome_only)
+    elif channel_names:
+        # Fallback: no OME object — attach channel names only (no per-channel metadata)
+        coords_base = {"c": list(channel_names)}
+    else:
+        coords_base = {}
     clean_base = _sanitise_attrs(base_attrs, ome_only=ome_only)
 
     datasets: typing.Dict[str, xr.DataTree] = {}

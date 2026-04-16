@@ -15,7 +15,11 @@ from bioio_base import exceptions, test_utilities
 from distributed import Client, LocalCluster
 
 from bioio_tifffile import Reader
-from bioio_tifffile.qptiff_metadata import parse_qpi_xml
+from bioio_tifffile.qptiff_metadata import (
+    ome_metadata_from_qptiff,
+    ome_to_flat_attrs,
+    parse_qpi_xml,
+)
 
 from .conftest import LOCAL_RESOURCES_DIR
 
@@ -235,11 +239,11 @@ class TestParseQpiXml:
 
     def test_brightfield_to_dict_keys(self) -> None:
         meta = parse_qpi_xml(BRIGHTFIELD_XML, n_channels=3)
-        d = meta.to_dict()
+        d = ome_to_flat_attrs(ome_metadata_from_qptiff(meta))
         assert d["qpi_slide_id"] == "TestSlide_001"
         assert d["Pixels:PhysicalSizeX"] == pytest.approx(0.25)
         assert d["Channel:0:Name"] == "Red"
-        assert d["qpi_is_brightfield"] is True
+        assert d["qpi_is_brightfield"] == "True"
 
     def test_fluorescence_channels(self) -> None:
         meta = parse_qpi_xml(FLUORESCENCE_XML)
