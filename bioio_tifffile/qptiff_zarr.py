@@ -98,30 +98,192 @@ def _normalise_shapes(
     return shapes  # type: ignore[return-value]
 
 
-def _extract_qpi_annotation(ome: object) -> Optional[Dict[str, str]]:
-    """Return the qpi://vectra MapAnnotation value as a plain dict, or None."""
-    for ann in getattr(ome, "structured_annotations", []):
-        if getattr(ann, "namespace", None) == "qpi://vectra":
-            value = ann.value
-            if not value:
-                return {}
-            # ann.value is an ome_types.model.Map (not JSON-serialisable);
-            # convert to a plain dict of strings so zarr can serialise it.
-            return {str(k): str(v) for k, v in value.items()}
-    return None
-
-
 def _ome_color_to_hex(color: object) -> Optional[str]:
-    """Convert an ome_types Color to a 6-char uppercase hex string (RRGGBB)."""
+    """Convert an ome_types Color to a 6-char uppercase hex string (RRGGBB).
+
+    ome_types Color stores colour as a packed RGBA int regardless of whether it
+    was constructed from a hex string or a CSS name (e.g. "blue").  Extracting
+    the int is the only reliable path; string inspection fails for named colours.
+    """
     if color is None:
         return None
     try:
-        s = str(color).lstrip("#")
-        if len(s) >= 6 and all(c in "0123456789abcdefABCDEF" for c in s[:6]):
-            return s[:6].upper()
+        rgba = int(color)  # packed RGBA: bits 31-24=R, 23-16=G, 15-8=B, 7-0=A
+        r = (rgba >> 24) & 0xFF
+        g = (rgba >> 16) & 0xFF
+        b = (rgba >> 8) & 0xFF
+        return f"{r:02X}{g:02X}{b:02X}"
     except Exception:
         pass
     return None
+
+
+def _build_qpi_block(ome: object) -> Optional[Dict[str, Any]]:
+    """Build the structured ``qpi`` zarr attribute block from an OME object.
+
+    Returns a dict with two keys:
+
+    ``"image"``
+        Image-level metadata: instrument model, objective, detector, experimenter,
+        acquisition software, and any image-scope fields from the ``qpi://vectra``
+        MapAnnotation that lack an OME equivalent.
+
+    ``"channels"``
+        A list of per-channel dicts, one entry per channel (indexed to match the
+        ``c`` axis).  Each dict combines:
+
+        - OME fields that are not part of the OME-NGFF spec (emission/excitation
+          wavelengths, exposure time, detector gain/binning, filter names resolved
+          via ``LightPath``, fluorophore, colour name).
+        - QPTIFF-vendor fields from the ``qpi://vectra`` MapAnnotation (responsivity,
+          filter part numbers, ROI, autofluorescence flag, etc.).
+
+    Returns ``None`` when there is no meaningful QPI data (non-QPTIFF files).
+    """
+    # --- resolve MapAnnotation ch<N>_* keys into per-channel dicts ----------
+    ann_image: Dict[str, str] = {}
+    ann_channels: Dict[int, Dict[str, str]] = {}
+    import re as _re
+    _ch_re = _re.compile(r"^ch(\d+)_(.+)$")
+    for ann in getattr(ome, "structured_annotations", []):
+        if getattr(ann, "namespace", None) != "qpi://vectra":
+            continue
+        for k, v in (ann.value or {}).items():
+            m = _ch_re.match(str(k))
+            if m:
+                ann_channels.setdefault(int(m.group(1)), {})[m.group(2)] = str(v)
+            else:
+                ann_image[str(k)] = str(v)
+
+    # --- build filter id → model lookup from Instrument ---------------------
+    filter_model: Dict[str, str] = {}
+    try:
+        for f in ome.instruments[0].filters:  # type: ignore[union-attr]
+            if getattr(f, "id", None) and getattr(f, "model", None):
+                filter_model[str(f.id)] = str(f.model)
+    except (AttributeError, IndexError, TypeError):
+        pass
+
+    # --- image-level block ---------------------------------------------------
+    image_block: Dict[str, Any] = {}
+
+    # instrument
+    try:
+        mic = ome.instruments[0].microscope  # type: ignore[union-attr]
+        if getattr(mic, "model", None):
+            image_block["microscope_model"] = str(mic.model)
+    except (AttributeError, IndexError, TypeError):
+        pass
+    try:
+        obj = ome.instruments[0].objectives[0]  # type: ignore[union-attr]
+        if getattr(obj, "model", None):
+            image_block["objective_model"] = str(obj.model)
+        if getattr(obj, "nominal_magnification", None) is not None:
+            image_block["objective_magnification"] = float(obj.nominal_magnification)
+    except (AttributeError, IndexError, TypeError):
+        pass
+    try:
+        det = ome.instruments[0].detectors[0]  # type: ignore[union-attr]
+        if getattr(det, "model", None):
+            image_block["detector_model"] = str(det.model)
+    except (AttributeError, IndexError, TypeError):
+        pass
+
+    # experimenter
+    try:
+        exp = ome.experimenters[0]  # type: ignore[union-attr]
+        if getattr(exp, "user_name", None):
+            image_block["experimenter"] = str(exp.user_name)
+    except (AttributeError, IndexError, TypeError):
+        pass
+
+    # acquisition date
+    try:
+        acq = ome.images[0].acquisition_date  # type: ignore[union-attr]
+        if acq:
+            image_block["acquisition_date"] = str(acq)
+    except (AttributeError, IndexError, TypeError):
+        pass
+
+    # vendor fields without OME equivalent
+    image_block.update(ann_image)
+
+    # --- per-channel list ----------------------------------------------------
+    channels_list: List[Dict[str, Any]] = []
+    try:
+        px = ome.images[0].pixels  # type: ignore[union-attr]
+        ome_channels = getattr(px, "channels", [])
+        ome_planes = getattr(px, "planes", [])
+        plane_by_c: Dict[int, Any] = {int(p.the_c): p for p in ome_planes}
+
+        for i, ch in enumerate(ome_channels):
+            entry: Dict[str, Any] = {}
+
+            # OME channel fields not in OME-NGFF spec
+            if getattr(ch, "fluor", None):
+                entry["fluor"] = str(ch.fluor)
+
+            # colour: always store hex; also store the human name when it's a
+            # CSS keyword (e.g. "blue") rather than a "#rrggbb" string.
+            color = getattr(ch, "color", None)
+            if color is not None:
+                hex_c = _ome_color_to_hex(color)
+                if hex_c:
+                    entry["color_hex"] = hex_c
+                color_str = str(color).strip()
+                if color_str and not color_str.startswith("#"):
+                    entry["color_name"] = color_str
+
+            if getattr(ch, "emission_wavelength", None) is not None:
+                entry["emission_wavelength_nm"] = float(ch.emission_wavelength)
+            if getattr(ch, "excitation_wavelength", None) is not None:
+                entry["excitation_wavelength_nm"] = float(ch.excitation_wavelength)
+
+            # detector settings
+            ds = getattr(ch, "detector_settings", None)
+            if ds is not None:
+                if getattr(ds, "gain", None) is not None:
+                    entry["gain"] = float(ds.gain)
+                if getattr(ds, "binning", None) is not None:
+                    # ds.binning is a Binning enum; .value gives "2x2" etc.
+                    bval = getattr(ds.binning, "value", None) or str(ds.binning)
+                    entry["binning"] = str(bval)
+
+            # filter names resolved via LightPath
+            lp = getattr(ch, "light_path", None)
+            if lp is not None:
+                exc_refs = getattr(lp, "excitation_filters", [])
+                if exc_refs:
+                    name = filter_model.get(str(exc_refs[0].id))
+                    if name:
+                        entry["excitation_filter"] = name
+                emi_refs = getattr(lp, "emission_filters", [])
+                if emi_refs:
+                    name = filter_model.get(str(emi_refs[0].id))
+                    if name:
+                        entry["emission_filter"] = name
+
+            # exposure time from Plane
+            plane = plane_by_c.get(i)
+            if plane is not None and getattr(plane, "exposure_time", None) is not None:
+                entry["exposure_time_us"] = float(plane.exposure_time)
+
+            # vendor-specific fields from MapAnnotation (responsivity, part nos, ROI, …)
+            entry.update(ann_channels.get(i, {}))
+
+            channels_list.append(entry)
+    except (AttributeError, IndexError, TypeError):
+        pass
+
+    if not image_block and not channels_list and not ann_channels:
+        return None
+
+    result: Dict[str, Any] = {}
+    if image_block:
+        result["image"] = image_block
+    if channels_list:
+        result["channels"] = channels_list
+    return result
 
 
 def _build_ngff_zattrs(
@@ -212,9 +374,9 @@ def _build_ngff_zattrs(
     zattrs: Dict[str, Any] = {"ome": ome_dict}
 
     if not ome_only:
-        qpi_attrs = _extract_qpi_annotation(ome)
-        if qpi_attrs:
-            zattrs["qpi"] = qpi_attrs
+        qpi_block = _build_qpi_block(ome)
+        if qpi_block:
+            zattrs["qpi"] = qpi_block
 
     return zattrs
 
@@ -231,6 +393,7 @@ def write_ome_zarr(
     shard_shape: Optional[Union[Tuple[int, ...], List[Tuple[int, ...]]]] = None,
     compressor: Optional[Any] = None,
     validate: bool = True,
+    consolidate: bool = True,
 ) -> zarr.Group:
     """
     Write a multiscale DataTree to an OME-NGFF v0.5 zarr store.
@@ -272,6 +435,11 @@ def write_ome_zarr(
         If True (default), validate the written store against the OME-NGFF v0.5
         spec using ``ome_zarr_models.open_ome_zarr``. Raises
         ``pydantic.ValidationError`` or ``ValueError`` if the output is invalid.
+    consolidate:
+        If True (default), call ``zarr.consolidate_metadata`` after writing.
+        This merges all per-group ``zarr.json`` files into a single root-level
+        entry so the full store metadata can be read in one I/O — important
+        for stores accessed through tarballs or remote object storage.
 
     Returns
     -------
@@ -343,6 +511,20 @@ def write_ome_zarr(
 
         zarr_arr = root.create_array(f"{name}/image", **create_kwargs)
 
+        # Per-scale group attrs and dimension coordinate arrays.
+        # Writing c/y/x as sibling arrays to `image` lets xarray (and any
+        # other reader that opens the group directly) auto-detect them as
+        # dimension coordinates without needing to read the root OME attrs.
+        px_sizes = xr_arr.attrs.get("pixel_size_um")
+        py_um = float(px_sizes[0]) if px_sizes is not None else 1.0
+        px_um = float(px_sizes[1]) if px_sizes is not None else 1.0
+        level_idx = int(name[5:])  # "scaleN" → N
+
+        root[name].attrs.update({
+            "scale_level": level_idx,
+            "pixel_size_um": [py_um, px_um],
+        })
+
         data = xr_arr.data
         if isinstance(data, da.Array):
             dask_arrays.append(data)
@@ -365,6 +547,26 @@ def write_ome_zarr(
 
     # write OME-NGFF v0.5 root .zattrs
     zattrs = _build_ngff_zattrs(datatree, ome, ome_only=ome_only)
+
+    # embed full OME-XML so the complete OME object (instrument, filters,
+    # detector settings, exposure times, experimenter, …) can be round-tripped
+    # via ome_types.from_xml(z.attrs["OME"]) — fields not in the OME-NGFF spec
+    # are otherwise inaccessible to standard readers.
+    try:
+        zattrs["OME"] = ome.to_xml()  # type: ignore[union-attr]
+    except Exception:
+        pass  # non-OME files: skip silently
+
+    # OME-NGFF v0.4 compatibility: SpatialData and multiscale-spatial-image
+    # look for "multiscales" at the root level (not nested under "ome").
+    # Writing both lets our zarr v3 store be parsed by Image2DModel.parse()
+    # without any structural changes.
+    try:
+        zattrs["multiscales"] = zattrs["ome"]["multiscales"]
+        zattrs["multiscaleSpatialImageVersion"] = 1
+    except (KeyError, TypeError):
+        pass
+
     root.attrs.update(zattrs)
 
     # validate against OME-NGFF v0.5 spec — Pydantic-validates the ome attrs
@@ -372,6 +574,12 @@ def write_ome_zarr(
     if validate:
         from ome_zarr_models import open_ome_zarr
         open_ome_zarr(root, version="0.5")  # raises on any spec violation
+
+    # consolidate all per-group zarr.json files into a single root-level entry
+    # so the full store metadata is readable in one I/O (critical for tarballs
+    # and remote object storage where directory traversal is expensive).
+    if consolidate:
+        zarr.consolidate_metadata(root.store)
 
     log.debug("Wrote OME-NGFF v0.5 zarr store: %s (%d levels)", store, n_levels)
     return root

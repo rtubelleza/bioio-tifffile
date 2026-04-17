@@ -18,10 +18,61 @@ import multiscale_spatial_image  # registers the .msi accessor on xr.DataTree
 import numpy as np
 import xarray as xr
 
-from .qptiff_metadata import ChannelInfo
-from .qptiff_ome import ome_to_channel_coords
+from .qptiff_types import ChannelInfo
 
 _UPPER_TO_LOWER = {"C": "c", "S": "c", "Y": "y", "X": "x", "Z": "z", "T": "t"}
+
+# ChannelInfo fields to promote as per-channel xarray coordinates.
+# color_rgb tuples are converted to "#rrggbb" hex strings for JSON safety.
+_CHANNEL_COORD_FIELDS = [
+    "fluorophore",
+    "exposure_time_us",
+    "emission_wavelength_nm",
+    "excitation_wavelength_nm",
+    "is_brightfield",
+    "color_rgb",
+    "is_unmixed_component",
+    "gain",
+    "binning",
+    "bit_depth",
+    "excitation_filter_name",
+    "emission_filter_name",
+    "excitation_filter_manufacturer",
+    "emission_filter_manufacturer",
+    "responsivity",
+    "autofluorescence_subtracted",
+    "signal_units",
+]
+
+
+def channel_infos_to_coords(
+    channel_infos: typing.List[ChannelInfo],
+    channel_dim: str = "c",
+) -> typing.Dict[str, typing.Any]:
+    """Build xarray coords from a list of ChannelInfo objects.
+
+    The primary ``channel_dim`` coordinate holds channel names. Additional
+    per-channel fields from ``_CHANNEL_COORD_FIELDS`` are attached when at
+    least one channel has a non-None value. ``color_rgb`` tuples are
+    serialised as ``"#rrggbb"`` hex strings.
+    """
+    coords: typing.Dict[str, typing.Any] = {}
+    coords[channel_dim] = xr.Variable(channel_dim, [ch.name for ch in channel_infos])
+
+    for field in _CHANNEL_COORD_FIELDS:
+        raw = [getattr(ch, field, None) for ch in channel_infos]
+        if not any(v is not None for v in raw):
+            continue
+        if field == "color_rgb":
+            values: typing.List[typing.Any] = [
+                f"#{v[0]:02x}{v[1]:02x}{v[2]:02x}" if v is not None else None
+                for v in raw
+            ]
+        else:
+            values = raw
+        coords[field] = xr.Variable(channel_dim, values)
+
+    return coords
 
 
 def squeeze_to_cyx(arr: xr.DataArray) -> xr.DataArray:
@@ -80,54 +131,41 @@ def compute_scale_attrs(
 
 def _sanitise_attrs(
     attrs: typing.Dict[str, typing.Any],
-    ome_only: bool = False,
 ) -> typing.Dict[str, typing.Any]:
+    """Strip None values from an attrs dict.
+
+    Nested dicts (structured metadata blocks) are kept as-is — they are
+    JSON-serializable and zarr / xarray handle them correctly when stored.
+    Non-JSON-safe types (numpy arrays, dataclass instances, etc.) are dropped.
     """
-    xarray's netCDF-leaning attrs treat plain dicts and None poorly, which
-    causes headaches for consumers serialising the tree. Strip those values
-    and stringify any remaining non-primitive types. When ``ome_only`` is
-    True, also drop vendor keys that use the ``qpi_`` prefix.
-    """
-    clean: typing.Dict[str, typing.Any] = {}
+    result: typing.Dict[str, typing.Any] = {}
     for k, v in attrs.items():
         if v is None:
             continue
-        if ome_only and isinstance(k, str) and k.startswith("qpi_"):
-            continue
-        if isinstance(v, (str, int, float, bool, list, tuple, np.ndarray)):
-            clean[k] = v
-    return clean
+        if isinstance(v, (str, int, float, bool, list, tuple, dict)):
+            result[k] = v
+    return result
 
 
 def build_datatree_from_levels(
     levels_arrays: typing.List[xr.DataArray],
-    channel_names: typing.Optional[typing.List[str]],
     pixel_size_yx_um: typing.Optional[typing.Tuple[float, float]],
     base_attrs: typing.Dict[str, typing.Any],
     channel_infos: typing.Optional[typing.List[ChannelInfo]] = None,
-    ome_only: bool = False,
-    ome: typing.Optional[object] = None,
+    channel_names: typing.Optional[typing.List[str]] = None,
 ) -> xr.DataTree:
     """
-    Assemble an xr.DataTree with `/scale0`, `/scale1`, ... children, to
-    follow spec of multiscale_spatial_image
+    Assemble an xr.DataTree with `/scale0`, `/scale1`, ... children.
 
-    Each child wraps a single `image` data variable in an xr.Dataset. Input
-    arrays are expected to already be in (c, y, x) layout; pass them through
-    `squeeze_to_cyx` upstream.
+    Input arrays must already be in ``(c, y, x)`` layout (pass through
+    ``squeeze_to_cyx`` upstream). Channel coordinates are built from
+    ``channel_infos`` (full ChannelInfo per channel) when provided, falling
+    back to bare ``channel_names`` strings for non-QPTIFF files.
 
-    When ``pixel_size_yx_um`` is known, each level additionally carries
-    physical ``y`` / ``x`` coordinates (in um, aligned to the pixel grid at
-    that level).
-
-    Attribute placement:
-
-    - Image-global metadata (``base_attrs``) goes on the root DataTree
-      attrs — it applies to every scale identically.
-    - Per-level metadata (``level``, ``scale_factors``, ``pixel_size_um``)
-      goes on the ``image`` DataArray's attrs, not on the Dataset or node
-      wrapping it. This keeps all scale-varying info travelling with the
-      array when callers slice out a single level.
+    Physical ``y``/``x`` coordinates are added when ``pixel_size_yx_um`` is
+    known. Per-level attrs (``level``, ``scale_factors``, ``pixel_size_um``)
+    travel on the ``image`` DataArray; image-global ``base_attrs`` go on the
+    root DataTree node.
     """
     if not levels_arrays:
         raise ValueError("levels_arrays must contain at least one level")
@@ -137,14 +175,13 @@ def build_datatree_from_levels(
         int(levels_arrays[0].sizes.get("x", 1)),
     )
 
-    if ome is not None:
-        coords_base = ome_to_channel_coords(ome, channel_dim="c", ome_only=ome_only)
+    if channel_infos:
+        coords_base = channel_infos_to_coords(channel_infos, channel_dim="c")
     elif channel_names:
-        # Fallback: no OME object — attach channel names only (no per-channel metadata)
-        coords_base = {"c": list(channel_names)}
+        coords_base = {"c": xr.Variable("c", channel_names)}
     else:
         coords_base = {}
-    clean_base = _sanitise_attrs(base_attrs, ome_only=ome_only)
+    clean_base = _sanitise_attrs(base_attrs)
 
     datasets: typing.Dict[str, xr.DataTree] = {}
     for i, arr in enumerate(levels_arrays):
@@ -168,8 +205,21 @@ def build_datatree_from_levels(
                 attrs={"units": "um", "pixel_size_um": px_um},
             )
 
-        all_coords = {**coords_base, **coords_spatial}
-        arr_with_coords = arr.assign_coords(all_coords) if all_coords else arr
+        # Normalise to explicit xr.Variable objects — the (dims, data) tuple
+        # shorthand is ambiguous in newer xarray and can cause TypeError when
+        # any data value is None or when xarray tries to infer coord types.
+        safe_coords: typing.Dict[str, typing.Any] = {}
+        for k, v in {**coords_base, **coords_spatial}.items():
+            if v is None:
+                continue
+            if isinstance(v, tuple) and len(v) == 2 and isinstance(v[0], str):
+                dims_v, data_v = v
+                if data_v is not None:
+                    safe_coords[k] = xr.Variable(dims_v, data_v)
+            else:
+                safe_coords[k] = v
+
+        arr_with_coords = arr.assign_coords(safe_coords) if safe_coords else arr
         # per-level attrs live on the DataArray so they ride with a sliced
         # `.image` and don't pollute the Dataset node attrs.
         arr_with_coords.attrs = {**arr_with_coords.attrs, **scale_attrs}

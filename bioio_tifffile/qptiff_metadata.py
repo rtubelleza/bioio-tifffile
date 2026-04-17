@@ -8,7 +8,7 @@ metadata split into three main components;
   qptiff_ome.py: OME conversion and xarray extraction helpers
 """
 
-from .qptiff_ome import ome_metadata_from_qptiff, ome_to_channel_coords, ome_to_flat_attrs
+from .qptiff_ome import ome_metadata_from_qptiff, ome_to_channel_coords, ome_to_flat_attrs, qptiff_meta_to_root_attrs
 from .qptiff_parser import (
     TIFF_DATETIME_TAG,
     TIFF_IMAGE_DESCRIPTION_TAG,
@@ -51,6 +51,7 @@ __all__ = [
     "ome_metadata_from_qptiff",
     "ome_to_channel_coords",
     "ome_to_flat_attrs",
+    "qptiff_meta_to_root_attrs",
     "parse_qpi_xml",
     "_format_binning",
 ]

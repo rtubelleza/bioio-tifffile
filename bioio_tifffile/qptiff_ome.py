@@ -143,11 +143,14 @@ def ome_metadata_from_qptiff(
     filter_idx = 0
 
     def _make_filter(
-        name: Optional[str], manufacturer: Optional[str], fid: str
+        name: Optional[str],
+        manufacturer: Optional[str],
+        part_no: Optional[str],
+        fid: str,
     ) -> Optional[Filter]:
-        if not name and not manufacturer:
+        if not name and not manufacturer and not part_no:
             return None
-        return Filter(id=fid, model=name, manufacturer=manufacturer)
+        return Filter(id=fid, model=name, manufacturer=manufacturer, lot_number=part_no)
 
     exc_filter_ids: Dict[int, str] = {}
     emi_filter_ids: Dict[int, str] = {}
@@ -156,6 +159,7 @@ def ome_metadata_from_qptiff(
         exc = _make_filter(
             ch.excitation_filter_name,
             ch.excitation_filter_manufacturer,
+            ch.excitation_filter_part_no,
             f"Filter:{filter_idx}",
         )
         if exc:
@@ -166,6 +170,7 @@ def ome_metadata_from_qptiff(
         emi = _make_filter(
             ch.emission_filter_name,
             ch.emission_filter_manufacturer,
+            ch.emission_filter_part_no,
             f"Filter:{filter_idx}",
         )
         if emi:
@@ -191,11 +196,12 @@ def ome_metadata_from_qptiff(
 
     for ch in qpi.channels:
         det_settings = None
-        if ch.gain is not None or ch.binning is not None:
+        if ch.gain is not None or ch.binning is not None or ch.offset_counts is not None:
             det_settings = DetectorSettings(
                 id=detector_id,
                 gain=ch.gain,
                 binning=_format_binning(ch.binning),
+                offset=float(ch.offset_counts) if ch.offset_counts is not None else None,
             )
 
         exc_fid = exc_filter_ids.get(ch.index)
@@ -238,6 +244,12 @@ def ome_metadata_from_qptiff(
             plane_kwargs["position_y_unit"] = "\u00b5m"
         ome_planes.append(Plane(**plane_kwargs))  # type: ignore[arg-type]
 
+    # significant_bits: use the first channel's bit_depth (camera ADC depth,
+    # e.g. 14-bit data stored in uint16). All channels share the same camera.
+    sig_bits: Optional[int] = next(
+        (ch.bit_depth for ch in qpi.channels if ch.bit_depth is not None), None
+    ) or getattr(qpi.camera, "bit_depth", None)
+
     px_kwargs: Dict[str, object] = dict(
         id=pixels_id,
         dimension_order="XYZCT",
@@ -248,6 +260,8 @@ def ome_metadata_from_qptiff(
         size_c=size_c or max(1, len(qpi.channels)),
         size_t=size_t or 1,
     )
+    if sig_bits is not None:
+        px_kwargs["significant_bits"] = sig_bits
     if qpi.pixel_size_um is not None:
         px_kwargs["physical_size_x"] = qpi.pixel_size_um
         px_kwargs["physical_size_x_unit"] = "\u00b5m"
@@ -296,10 +310,9 @@ def ome_metadata_from_qptiff(
             ("responsivity_filter_id", ch.responsivity_filter_id),
             ("responsivity_date", ch.responsivity_date),
             ("responsivity_filter_name", ch.responsivity_filter_name),
-            ("excitation_filter_part_no", ch.excitation_filter_part_no),
-            ("emission_filter_part_no", ch.emission_filter_part_no),
-            ("bit_depth", _str(ch.bit_depth)),
-            ("offset_counts", _str(ch.offset_counts)),
+            # excitation/emission_filter_part_no → Filter.lot_number (mapped to OME)
+            # bit_depth → Pixels.significant_bits (mapped to OME)
+            # offset_counts → DetectorSettings.offset (mapped to OME)
             ("camera_orientation", ch.camera_orientation),
             ("roi_x", _str(ch.roi_x)),
             ("roi_y", _str(ch.roi_y)),
@@ -341,13 +354,13 @@ def ome_metadata_from_qptiff(
     return OME(**ome_kwargs)  # type: ignore[arg-type]
 
 
-def ome_to_flat_attrs(ome: object, *, ome_only: bool = False) -> Dict[str, Any]:
-    """Flat dict for xarray DataArray.attrs, derived from an OME object.
+def ome_to_flat_attrs(ome: object) -> Dict[str, Any]:
+    """Slide-level flat attrs for the DataTree root, derived from an OME object.
 
-    Replaces ``QptiffMetadata.to_dict()``.  OME standard fields use canonical
-    OME-XML key names (e.g. ``Pixels:PhysicalSizeX``, ``Channel:0:Name``).
-    PerkinElmer-specific fields from the ``qpi://vectra`` MapAnnotation carry
-    a ``qpi_`` prefix and are omitted when *ome_only* is ``True``.
+    Only image/slide-scoped fields are included here — instrument, experimenter,
+    pixel size, and stage position.  Per-channel metadata (wavelengths, exposure
+    times, detector settings, vendor fields) lives in ``ome_to_channel_coords``
+    and the OME object itself; it must not be flattened onto the root attrs.
     """
     d: Dict[str, Any] = {}
 
@@ -388,7 +401,7 @@ def ome_to_flat_attrs(ome: object, *, ome_only: bool = False) -> Dict[str, Any]:
         d["Pixels:PhysicalSizeY"] = float(px.physical_size_y)
         d["Pixels:PhysicalSizeYUnit"] = str(px.physical_size_y_unit or "\u00b5m")
 
-    # --- Stage position from first plane ------------------------------------
+    # --- Stage position (slide origin) from the first plane -----------------
     planes = getattr(px, "planes", [])
     if planes:
         p0 = planes[0]
@@ -398,49 +411,6 @@ def ome_to_flat_attrs(ome: object, *, ome_only: bool = False) -> Dict[str, Any]:
         if getattr(p0, "position_y", None) is not None:
             d["Plane:PositionY"] = float(p0.position_y)
             d["Plane:PositionYUnit"] = str(p0.position_y_unit or "\u00b5m")
-
-    # --- Per-channel OME fields ---------------------------------------------
-    plane_by_c: Dict[int, Any] = {int(p.the_c): p for p in planes}
-    for ch in getattr(px, "channels", []):
-        try:
-            ch_idx = int(str(ch.id).split(":")[-1])
-        except (AttributeError, ValueError):
-            continue
-        if getattr(ch, "name", None) is not None:
-            d[f"Channel:{ch_idx}:Name"] = ch.name
-        if getattr(ch, "fluor", None) is not None:
-            d[f"Channel:{ch_idx}:Fluor"] = ch.fluor
-        if getattr(ch, "color", None) is not None:
-            d[f"Channel:{ch_idx}:Color"] = str(ch.color)
-        if getattr(ch, "emission_wavelength", None) is not None:
-            d[f"Channel:{ch_idx}:EmissionWavelength"] = float(ch.emission_wavelength)
-            d[f"Channel:{ch_idx}:EmissionWavelengthUnit"] = str(
-                ch.emission_wavelength_unit or "nm"
-            )
-        if getattr(ch, "excitation_wavelength", None) is not None:
-            d[f"Channel:{ch_idx}:ExcitationWavelength"] = float(ch.excitation_wavelength)
-            d[f"Channel:{ch_idx}:ExcitationWavelengthUnit"] = str(
-                ch.excitation_wavelength_unit or "nm"
-            )
-        ds = getattr(ch, "detector_settings", None)
-        if ds is not None:
-            if getattr(ds, "gain", None) is not None:
-                d[f"DetectorSettings:{ch_idx}:Gain"] = ds.gain
-            if getattr(ds, "binning", None) is not None:
-                d[f"DetectorSettings:{ch_idx}:Binning"] = str(ds.binning)
-        plane = plane_by_c.get(ch_idx)
-        if plane is not None and getattr(plane, "exposure_time", None) is not None:
-            d[f"Plane:{ch_idx}:ExposureTime"] = float(plane.exposure_time)
-            d[f"Plane:{ch_idx}:ExposureTimeUnit"] = str(
-                plane.exposure_time_unit or "\u00b5s"
-            )
-
-    # --- QPTIFF vendor annotation -------------------------------------------
-    if not ome_only:
-        for ann in getattr(ome, "structured_annotations", []):
-            if getattr(ann, "namespace", None) == "qpi://vectra":
-                for k, v in (ann.value or {}).items():
-                    d[f"qpi_{k}"] = v
 
     return d
 
@@ -557,4 +527,46 @@ def ome_to_channel_coords(
             if any(v is not None for v in vals):
                 coords[f"qpi_{field_name}"] = (channel_dim, vals)
 
-    return coords
+
+def _drop_none(obj: Any) -> Any:
+    """Recursively remove None values from dicts/lists (for clean attrs)."""
+    if isinstance(obj, dict):
+        return {k: _drop_none(v) for k, v in obj.items() if v is not None}
+    if isinstance(obj, list):
+        return [_drop_none(v) for v in obj]
+    return obj
+
+
+def qptiff_meta_to_root_attrs(meta: "QptiffMetadata") -> Dict[str, Any]:
+    """
+    Build structured nested attrs for the DataTree root from a QptiffMetadata.
+
+    Returns a dict with two top-level keys:
+
+    ``"slide_info"``
+        SlideInfo fields — instrument type, operator, study name, acquisition
+        software, datetime, barcode, slide ID.
+
+    ``"image_info"``
+        ImageInfo fields for the FullResolution scene — scan mode, objective,
+        pixel size, stage position, camera and scan resolution info.
+
+    Per-channel metadata lives on the ``c`` xarray coordinates (see
+    ``channel_infos_to_coords`` in multiscale.py), not in root attrs.
+    None-valued fields are omitted. The result is JSON-serializable.
+    """
+    from dataclasses import asdict
+
+    result: Dict[str, Any] = {}
+
+    slide_dict = _drop_none(asdict(meta.slide))
+    if slide_dict:
+        result["slide_info"] = slide_dict
+
+    fr = meta.full_resolution or (meta.images[0] if meta.images else None)
+    if fr is not None:
+        image_dict = _drop_none(asdict(fr.image_info))
+        if image_dict:
+            result["image_info"] = image_dict
+
+    return result

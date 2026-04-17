@@ -18,15 +18,15 @@ from fsspec.spec import AbstractFileSystem
 from tifffile import TiffFile, imread
 from tifffile.tifffile import TiffTags
 
-from .multiscale import build_datatree_from_levels, squeeze_to_cyx
+from .multiscale import build_datatree_from_levels, channel_infos_to_coords, squeeze_to_cyx
 from .qptiff_zarr import write_ome_zarr as _write_ome_zarr
 from .qptiff_metadata import (
+    ChannelInfo,
     QptiffMetadata,
     extract_datetime_from_page,
     ome_metadata_from_qptiff,
-    ome_to_channel_coords,
-    ome_to_flat_attrs,
     parse_qpi_xml,
+    qptiff_meta_to_root_attrs,
     valid_qpi_series,
 )
 from .utils import generate_ome_channel_id, generate_ome_image_id
@@ -339,19 +339,12 @@ class Reader(reader.Reader):
         self,
         image_shape: typing.Tuple[int, ...],
         dims: typing.List[str],
-        ome: typing.Optional[object] = None,
+        channel_infos: typing.Optional[typing.List[ChannelInfo]] = None,
     ) -> typing.Optional[typing.List[str]]:
-        """Derive channel names from the OME object for the active scene."""
+        """Derive channel names from ChannelInfo objects for the active scene."""
         names: typing.List[str] = []
-        if ome is not None:
-            try:
-                names = [
-                    ch.name
-                    for ch in ome.images[0].pixels.channels  # type: ignore[union-attr]
-                    if ch.name
-                ]
-            except (AttributeError, IndexError):
-                pass
+        if channel_infos is not None:
+            names = [ch.name for ch in channel_infos if ch.name]
 
         if not names:
             return None
@@ -378,7 +371,7 @@ class Reader(reader.Reader):
         shape: typing.Tuple[int, ...],
         scene_index: int,
         channel_names: typing.Optional[typing.List[str]],
-        ome: typing.Optional[object] = None,
+        channel_infos: typing.Optional[typing.List[ChannelInfo]] = None,
     ) -> typing.Dict[str, typing.Any]:
         coords: typing.Dict[str, typing.Any] = {}
         ch_dim = dimensions.DimensionNames.Channel  # "C"
@@ -392,7 +385,11 @@ class Reader(reader.Reader):
         else:
             active_dim = None
 
-        if channel_names is None:
+        if channel_infos is not None and active_dim == ch_dim:
+            # Full per-channel coords from ChannelInfo — use uppercase "C" dim
+            extra = channel_infos_to_coords(channel_infos, channel_dim=ch_dim)
+            coords.update(extra)
+        elif channel_names is None:
             if active_dim == ch_dim:
                 image_id = generate_ome_image_id(scene_index)
                 coords[ch_dim] = [
@@ -403,17 +400,6 @@ class Reader(reader.Reader):
         else:
             if active_dim is not None:
                 coords[active_dim] = channel_names
-
-        # Attach per-channel metadata derived from the OME object. The channel
-        # axis entry itself is set above, so drop the duplicate entry.
-        if ome is not None and active_dim == ch_dim and channel_names:
-            extra = ome_to_channel_coords(
-                ome,
-                channel_dim=ch_dim,
-                ome_only=self._ome_only,
-            )
-            extra.pop(ch_dim, None)
-            coords.update(extra)
 
         return coords
 
@@ -567,14 +553,15 @@ class Reader(reader.Reader):
                 if valid_qpi_series(series.pages):
                     meta = self._get_or_parse_meta(tiff_series_idx, series)
                     attrs = self._build_attrs(tiff_tags, meta, series)
-                    ome = ome_metadata_from_qptiff(meta) # change func to *_from_qptiffmetadata maybe
-                    channels = self._get_channel_names_for_scene(image_data.shape, dims, ome=ome)
+                    channels = self._get_channel_names_for_scene(
+                        image_data.shape, dims, channel_infos=meta.channels
+                    )
                     coords = self._get_coords(
                         dims,
                         image_data.shape,
                         scene_index=self.current_scene_index,
                         channel_names=channels,
-                        ome=ome,
+                        channel_infos=meta.channels,
                     )
                 else:
                     # non-QPTIFF tifffile fallback; NOTE: can remove if this becomes standalone plugin,
@@ -629,14 +616,15 @@ class Reader(reader.Reader):
                     meta = self._get_or_parse_meta(tiff_series_idx, series)
                     image_data = series.levels[level_idx].asarray()
                     attrs = self._build_attrs(tiff_tags, meta, series)
-                    ome = ome_metadata_from_qptiff(meta)
-                    channels = self._get_channel_names_for_scene(image_data.shape, dims, ome=ome)
+                    channels = self._get_channel_names_for_scene(
+                        image_data.shape, dims, channel_infos=meta.channels
+                    )
                     coords = self._get_coords(
                         dims,
                         image_data.shape,
                         scene_index=self.current_scene_index,
                         channel_names=channels,
-                        ome=ome,
+                        channel_infos=meta.channels,
                     )
                 else:
                     # tifffile
@@ -932,38 +920,14 @@ class Reader(reader.Reader):
         series = tiff.series[tiff_series_idx]
         dims = self._get_dims_for_scene(tiff)
 
-        ome_obj: typing.Optional[object] = None
+        channel_infos: typing.Optional[typing.List[ChannelInfo]] = None
         base_attrs: typing.Dict[str, typing.Any] = {}
         if valid_qpi_series(series.pages):
             meta = self._get_or_parse_meta(tiff_series_idx, series)
             base_attrs = self._build_attrs(self._get_tiff_tags(tiff), meta, series)
-            if tiff_series_idx in self._ome_cache:
-                ome_obj = self._ome_cache[tiff_series_idx]
-            else:
-                level0 = series.levels[0]
-                axes0 = getattr(level0, "axes", "")
-                shape_map0 = dict(zip(axes0.upper(), level0.shape))
-                ome_obj = ome_metadata_from_qptiff(
-                    meta,
-                    scene_name=self.scenes[self.current_scene_index],
-                    size_x=shape_map0.get("X"),
-                    size_y=shape_map0.get("Y"),
-                    size_z=shape_map0.get("Z"),
-                    size_c=shape_map0.get("C", shape_map0.get("S")),
-                    size_t=shape_map0.get("T"),
-                )
-                self._ome_cache[tiff_series_idx] = ome_obj
+            channel_infos = meta.channels or None
         else:
-            tiff_tags = self._get_tiff_tags(tiff)
-            try:
-                base_attrs = {
-                    constants.METADATA_UNPROCESSED: tiff_tags,
-                    constants.METADATA_PROCESSED: tiff_tags[
-                        TIFF_IMAGE_DESCRIPTION_TAG_INDEX
-                    ],
-                }
-            except KeyError:
-                base_attrs = {constants.METADATA_UNPROCESSED: tiff_tags}
+            base_attrs = {}
 
         px = self.physical_pixel_sizes
         pixel_size_yx_um: typing.Optional[typing.Tuple[float, float]] = None
@@ -983,9 +947,10 @@ class Reader(reader.Reader):
             else:
                 data = level_series.asarray()
 
-            channels = self._get_channel_names_for_scene(data.shape, dims, ome=ome_obj)
             if channel_names_ref is None:
-                channel_names_ref = channels
+                channel_names_ref = self._get_channel_names_for_scene(
+                    data.shape, dims, channel_infos=channel_infos
+                )
 
             arr = xr.DataArray(data, dims=dims)
             arr = squeeze_to_cyx(arr)
@@ -993,11 +958,10 @@ class Reader(reader.Reader):
 
         return build_datatree_from_levels(
             levels_arrays=level_arrays,
-            channel_names=channel_names_ref,
             pixel_size_yx_um=pixel_size_yx_um,
             base_attrs=base_attrs,
-            ome_only=self._ome_only,
-            ome=ome_obj,
+            channel_infos=channel_infos,
+            channel_names=channel_names_ref,
         )
 
     # qptiff
@@ -1007,15 +971,8 @@ class Reader(reader.Reader):
         meta: QptiffMetadata,
         series: typing.Any = None,
     ) -> typing.Dict[str, typing.Any]:
-        attrs: typing.Dict[str, typing.Any] = {
-            constants.METADATA_UNPROCESSED: tiff_tags,
-        }
-        if meta.raw_xml:
-            attrs[constants.METADATA_PROCESSED] = meta.raw_xml
-
         # extract XPosition / YPosition from TIFF tags (tag 286 / 287) and
         # convert to um using the same scalar table as pixel size.
-        # should b Tags 286=XPosition, 287=YPosition, 296=ResolutionUnit?
         _TIFF_XPOS = 286
         _TIFF_YPOS = 287
         _TIFF_RESUNIT = 296
@@ -1030,12 +987,11 @@ class Reader(reader.Reader):
             if isinstance(ypos, tuple) and len(ypos) == 2 and ypos[1]:
                 img_info.yposition_um = scalar * ypos[0] / ypos[1]
 
-        ome = ome_metadata_from_qptiff(meta)
-        attrs.update(ome_to_flat_attrs(ome, ome_only=self._ome_only))
-        if series is not None and not self._ome_only:
+        attrs = qptiff_meta_to_root_attrs(meta)
+
+        if series is not None:
             n_levels = len(getattr(series, "levels", [series]))
-            attrs["qpi_pyramid_level_count"] = n_levels
-            attrs["qpi_is_pyramidal"] = n_levels > 1
+            attrs["pyramid_level_count"] = n_levels
         return attrs
 
     # qptiff

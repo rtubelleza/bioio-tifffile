@@ -558,6 +558,27 @@ def parse_qpi_xml(
         if ch.exposure_time_us is None and ch.index < len(exposure_times):
             ch.exposure_time_us = exposure_times[ch.index]
 
+    # Fusion paged: fluorophore lives in ScanProfile JSON, not per-page XML.
+    # experimentDescription.channels[] lists the filter cycle in order
+    # (e.g. ["DAPI", "ATTO550", "CY5", "AF750"]); channel i uses filter i % n.
+    if fmt == FORMAT_FUSION_PAGED and any(ch.fluorophore is None for ch in channels):
+        sp_elem = root.find("ScanProfile")
+        if sp_elem is not None and sp_elem.text and sp_elem.text.strip().startswith("{"):
+            try:
+                sp = json.loads(sp_elem.text)
+                exp = sp.get("experimentDescription", {})
+                filter_fluors = [
+                    c["name"] for c in exp.get("channels", [])
+                    if isinstance(c, dict) and c.get("name")
+                ]
+                if filter_fluors:
+                    n = len(filter_fluors)
+                    for ch in channels:
+                        if ch.fluorophore is None:
+                            ch.fluorophore = filter_fluors[ch.index % n]
+            except (ValueError, TypeError, KeyError):
+                pass
+
     image = QptiffImageSceneMetadata(
         image_info=image_info,
         channels=channels,
