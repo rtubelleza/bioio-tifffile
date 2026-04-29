@@ -992,6 +992,11 @@ class Reader(reader.Reader):
         if series is not None:
             n_levels = len(getattr(series, "levels", [series]))
             attrs["pyramid_level_count"] = n_levels
+
+        # bioio-base Reader.metadata looks for these keys in xarray_dask_data.attrs
+        attrs[constants.METADATA_UNPROCESSED] = tiff_tags
+        attrs[constants.METADATA_PROCESSED] = meta
+
         return attrs
 
     # qptiff
