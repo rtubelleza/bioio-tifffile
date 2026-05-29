@@ -38,6 +38,19 @@ from .utils import generate_ome_channel_id, generate_ome_image_id
 UNKNOWN_DIM_CHARS = ["Q", "I"]
 TIFF_IMAGE_DESCRIPTION_TAG_INDEX = 270
 
+# TIFF tags excluded from the `unprocessed` metadata attrs dict (QPTIFF path):
+# - 270 ImageDescription: the QPI XML, fully parsed into the structured schema
+#   (slide_info / image_info / channel coords) and preserved on meta.raw_xml.
+# - 273/279/324/325: Strip/Tile offset + byte-count arrays — per-tile file byte
+#   locations, not metadata, and tens of KB each. Useless once pixels are read.
+_UNPROCESSED_TAG_EXCLUDE = {
+    TIFF_IMAGE_DESCRIPTION_TAG_INDEX,  # 270 ImageDescription (QPI XML)
+    273,  # StripOffsets
+    279,  # StripByteCounts
+    324,  # TileOffsets
+    325,  # TileByteCounts
+}
+
 FULL_RESOLUTION_TYPE = "FullResolution"  # qptiff
 
 log = logging.getLogger(__name__)
@@ -797,6 +810,12 @@ class Reader(reader.Reader):
             elif per_page_xmls:
                 n_channels = len(per_page_xmls)
 
+            # Brightfield = RGB samples (S dimension / >=3 samples per pixel).
+            # This is the reliable discriminator: a <BFLampType> element alone is
+            # not, since Fusion 2.x fluorescence scans also emit it.
+            samples_per_pixel = getattr(series.pages[0], "samplesperpixel", 1) or 1
+            is_rgb = samples_per_pixel >= 3 or ("S" in axes and "C" not in axes)
+
             datetime_str = extract_datetime_from_page(series.pages[0])
 
             self._qpi_meta_cache[tiff_series_idx] = parse_qpi_xml(
@@ -804,6 +823,7 @@ class Reader(reader.Reader):
                 n_channels=n_channels,
                 datetime_str=datetime_str,
                 per_page_xmls=per_page_xmls if per_page_xmls else None,
+                is_rgb=is_rgb,
             )
         return self._qpi_meta_cache[tiff_series_idx]
 
@@ -922,6 +942,7 @@ class Reader(reader.Reader):
 
         channel_infos: typing.Optional[typing.List[ChannelInfo]] = None
         base_attrs: typing.Dict[str, typing.Any] = {}
+        meta: typing.Optional[QptiffMetadata] = None
         if valid_qpi_series(series.pages):
             meta = self._get_or_parse_meta(tiff_series_idx, series)
             base_attrs = self._build_attrs(self._get_tiff_tags(tiff), meta, series)
@@ -956,13 +977,25 @@ class Reader(reader.Reader):
             arr = squeeze_to_cyx(arr)
             level_arrays.append(arr)
 
-        return build_datatree_from_levels(
+        dt = build_datatree_from_levels(
             levels_arrays=level_arrays,
             pixel_size_yx_um=pixel_size_yx_um,
             base_attrs=base_attrs,
             channel_infos=channel_infos,
             channel_names=channel_names_ref,
         )
+
+        # Retain the parsed QptiffMetadata object on the root attrs for parity
+        # with the single DataArray path (so attrs[METADATA_PROCESSED] is the
+        # same object on both). build_datatree_from_levels drops it because
+        # _sanitise_attrs keeps only JSON-safe types for a clean serialisable
+        # tree; re-attach it here. The zarr writer builds its own .zattrs from
+        # the OME object and never serialises the root attrs, so this does not
+        # affect write_ome_zarr output. (A direct dt.to_zarr() would need it
+        # stripped, but the supported write paths do not call that.)
+        if meta is not None:
+            dt.attrs[constants.METADATA_PROCESSED] = meta
+        return dt
 
     # qptiff
     def _build_attrs(
@@ -993,8 +1026,19 @@ class Reader(reader.Reader):
             n_levels = len(getattr(series, "levels", [series]))
             attrs["pyramid_level_count"] = n_levels
 
-        # bioio-base Reader.metadata looks for these keys in xarray_dask_data.attrs
-        attrs[constants.METADATA_UNPROCESSED] = tiff_tags
+        # bioio-base Reader.metadata looks for these keys in xarray_dask_data.attrs.
+        # `unprocessed` holds the raw TIFF tags EXCEPT the bulky, non-metadata
+        # ones (see _UNPROCESSED_TAG_EXCLUDE): the ImageDescription XML is fully
+        # parsed into the structured schema and kept on `meta.raw_xml`, and the
+        # Strip/Tile offset arrays are just file byte locations. Dropping them
+        # avoids duplicating tens of KB per scene (and per pyramid level once
+        # promoted onto the DataTree). Read the XML back via
+        # `reader.qpi_metadata.raw_xml` if needed.
+        attrs[constants.METADATA_UNPROCESSED] = {
+            code: value
+            for code, value in tiff_tags.items()
+            if code not in _UNPROCESSED_TAG_EXCLUDE
+        }
         attrs[constants.METADATA_PROCESSED] = meta
 
         return attrs

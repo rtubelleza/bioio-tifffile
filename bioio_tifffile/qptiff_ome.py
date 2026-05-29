@@ -272,6 +272,8 @@ def ome_metadata_from_qptiff(
     pixels = Pixels(**px_kwargs)  # type: ignore[arg-type]
 
     # image-level QPI annotation
+    sl = qpi.slide
+    ii = qpi._primary.image_info
     img_qpi: Dict[str, str] = {}
     for k, v in [
         ("description_version", qpi.description_version),
@@ -283,12 +285,23 @@ def ome_metadata_from_qptiff(
         ("study_name", qpi.study_name),
         ("computer_name", qpi.computer_name),
         ("datetime", qpi.datetime),
+        ("validation_code", sl.validation_code),
+        ("sample_description", sl.sample_description),
         ("bf_lamp_type", qpi.bf_lamp_type),
+        ("lamp_type", ii.lamp_type),
         ("scan_profile_name", qpi.scan_profile_name),
         ("scan_mode", qpi.scan_mode),
         ("is_tma", _str(qpi.is_tma)),
         ("opal_kit_type", qpi.opal_kit_type),
         ("acquisition_format", qpi.acquisition_format),
+        ("scale_factor", _str(ii.scale_factor)),
+        ("compression", ii.compression),
+        ("jpeg_quality", _str(ii.jpeg_quality)),
+        ("saturation_protection_type", ii.saturation_protection_type),
+        ("coverslip_thickness", ii.coverslip_thickness),
+        ("is_rna", _str(ii.is_rna)),
+        ("rotate_image", _str(ii.rotate_image)),
+        ("mirror_image", _str(ii.mirror_image)),
         ("camera_name", qpi.camera.camera_name),
         ("camera_gain", _str(qpi.camera.gain)),
         ("camera_bit_depth", _str(qpi.camera.bit_depth)),
@@ -306,6 +319,7 @@ def ome_metadata_from_qptiff(
             ("signal_units", _str(ch.signal_units)),
             ("objective", ch.objective),
             ("autofluorescence_subtracted", _str(ch.autofluorescence_subtracted)),
+            ("auto_expose_type", ch.auto_expose_type),
             ("responsivity", _str(ch.responsivity)),
             ("responsivity_filter_id", ch.responsivity_filter_id),
             ("responsivity_date", ch.responsivity_date),

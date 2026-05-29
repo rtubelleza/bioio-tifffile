@@ -180,14 +180,20 @@ def _parse_scan_profile_json(image_info: ImageInfo, scan_profile_text: str) -> N
 def _detect_format(
     root: ET.Element,
     scan_mode: str,
-    bf_lamp_type: Optional[str],
+    is_rgb: bool,
 ) -> str:
     """
     Identify which QPTIFF format variant produced this file.. a couple of versions
     as qptiff evolved from vectra
 
     1. **brightfield** — scan_mode contains "Brightfield" (case-insensitive) or
-       a ``<BFLampType>`` element is present (brightfield-only tag).
+       the pixel data is RGB (``is_rgb``, i.e. samples stored in the S dimension).
+
+       NOTE: a ``<BFLampType>`` element is *not* sufficient on its own. Newer
+       Fusion 2.x fluorescence scans also emit ``<BFLampType>WhiteLED</BFLampType>``
+       alongside per-channel fluorescence pages, so keying off it misclassified
+       multiplex panels as 3-sample brightfield and dropped every channel's
+       biomarker / fluorophore metadata.
     2. **polaris_scanband** — ``<ScanBands-i>`` elements are present anywhere in
        the tree (older Vectra/Polaris/OPAL XML ScanProfile format).
     3. **fusion_paged** — ``<ScanProfile>`` content is a JSON object (newer
@@ -196,7 +202,7 @@ def _detect_format(
     4. **unknown** — no recognised structural signal; caller should attempt
        strategies in sequence.
     """
-    if "brightfield" in scan_mode.lower() or bf_lamp_type is not None:
+    if "brightfield" in scan_mode.lower() or is_rgb:
         return FORMAT_BRIGHTFIELD
 
     if root.findall(".//ScanBands-i"):
@@ -314,6 +320,8 @@ def _populate_channel_fields_from_element(
         "autofluorescence_subtracted",
         _bool(elem.find("AutofluorescenceSubtracted")),
     )
+    # Polaris per-band auto-exposure mode (nested under the band's filter spec)
+    _set_if(fields, "auto_expose_type", _text(elem.find(".//AutoExposeType")))
 
     # responsivity / calibration
     resp = elem.find("Responsivity")
@@ -433,6 +441,7 @@ def parse_qpi_xml(
     n_channels: Optional[int] = None,
     datetime_str: Optional[str] = None,
     per_page_xmls: Optional[List[str]] = None,
+    is_rgb: bool = False,
 ) -> QptiffMetadata:
     """
     Parse the PerkinElmer QPI ImageDescription XML and return a QptiffMetadata.
@@ -448,6 +457,10 @@ def parse_qpi_xml(
         List of raw XML strings, one per channel page.  Used for newer
         PerkinElmer Fusion files where channel-level metadata (Biomarker,
         ExposureTime, filters) is stored per-page rather than in ScanBands-i.
+    is_rgb:
+        True when the pixel data is RGB (samples in the S dimension). This is
+        the reliable brightfield signal — a ``<BFLampType>`` element alone is
+        not, since Fusion 2.x fluorescence scans also carry it.
 
     Returns
     -------
@@ -488,11 +501,15 @@ def parse_qpi_xml(
     slide.operator_name = _text(root.find("OperatorName"))
     slide.computer_name = _text(root.find("ComputerName"))
     slide.instrument_type = _text(root.find("InstrumentType"))
+    slide.validation_code = _text(root.find("ValidationCode"))
+    slide.sample_description = _text(root.find("SampleDescription"))
 
     # image-scope fields
     image_info.image_type = _text(root.find("ImageType"))
     image_info.bf_lamp_type = _text(root.find("BFLampType"))
+    image_info.lamp_type = _text(root.find("LampType"))
     image_info.objective = _text(root.find("Objective"))
+    image_info.scale_factor = _float(root.find("ScaleFactor"))
 
     sp = root.find("ScanProfile")
     if sp is not None:
@@ -502,6 +519,18 @@ def parse_qpi_xml(
         image_info.scan_mode = _text(sp_root.find("Mode"))
         image_info.is_tma = _bool(sp_root.find("SampleIsTMA"))
         image_info.opal_kit_type = _text(sp_root.find("OpalKitType"))
+        # ScanProfile acquisition settings (Polaris/Vectra XML ScanProfile)
+        image_info.compression = _text(sp_root.find("Compression"))
+        image_info.jpeg_quality = _int(sp_root.find("JPEGQuality"))
+        image_info.saturation_protection_type = _text(
+            sp_root.find("SaturationProtectionType")
+        ) or _text(sp_root.find("FieldSaturationProtectionType"))
+        image_info.coverslip_thickness = _text(sp_root.find("CoverslipThickness"))
+        image_info.is_rna = _bool(sp_root.find("IsRNA"))
+        cam = sp_root.find("CameraSettings")
+        if cam is not None:
+            image_info.rotate_image = _bool(cam.find("RotateImage"))
+            image_info.mirror_image = _bool(cam.find("MirrorImage"))
 
     image_info.scan_resolution = _parse_scan_resolution(root)
 
@@ -514,7 +543,7 @@ def parse_qpi_xml(
     image_info.camera = _parse_camera(root)
 
     exposure_times = _parse_exposure_times(root)
-    fmt = _detect_format(root, image_info.scan_mode or "", image_info.bf_lamp_type)
+    fmt = _detect_format(root, image_info.scan_mode or "", is_rgb)
     log.debug("Detected QPTIFF format: %s (slide=%s)", fmt, slide.slide_id)
 
     if fmt == FORMAT_BRIGHTFIELD:
@@ -522,7 +551,25 @@ def parse_qpi_xml(
         channels = _parse_brightfield_channels(n)
 
     elif fmt == FORMAT_POLARIS_SCANBAND:
-        channels = _parse_fluorescence_channels(root, exposure_times)
+        # Newer "paged Polaris" files (Polaris/PhenoCycler, Fusion 2.x) carry the
+        # per-channel metadata — biomarker <Name>, <ExcitationFilter>/<EmissionFilter>,
+        # <Responsivity>, <ExposureTime>, <SignalUnits>, <Objective> — at each
+        # *page* XML root, like fusion_paged, while still exposing <ScanBands-i>
+        # filter-cube config in the shared ScanProfile. Detection lands on
+        # polaris_scanband because <ScanBands-i> is present, but the ScanBands-i
+        # describe the filter cube (not one stain each), so reading them yields
+        # unnamed channels and drops the filter/responsivity metadata.
+        #
+        # When the per-page XMLs are distinct, parse the page roots (rich
+        # per-channel data, handled by _populate_channel_fields_from_element).
+        # Fall back to the classic shared-XML ScanBands-i layout (old Vectra /
+        # Polaris OPAL, where every page repeats one root XML and the per-channel
+        # Biomarker/Fluorophore live inside ScanBands-i).
+        distinct_pages = {x for x in (per_page_xmls or []) if x}
+        if len(distinct_pages) > 1:
+            channels = _parse_channels_from_per_page_xmls(per_page_xmls)
+        else:
+            channels = _parse_fluorescence_channels(root, exposure_times)
 
     elif fmt == FORMAT_FUSION_PAGED:
         if per_page_xmls:

@@ -84,6 +84,8 @@ class SlideInfo:
     description_version: Optional[str] = None
     instrument_type: Optional[str] = None
     identifier: Optional[str] = None  # slide-level UUID
+    validation_code: Optional[str] = None  # file integrity hash, root <ValidationCode>
+    sample_description: Optional[str] = None  # free-text sample label, root <SampleDescription>  # noqa: E501
 
 
 @dataclass
@@ -103,11 +105,22 @@ class ImageInfo:
     image_type: Optional[str] = None  # FullResolution / Thumbnail / Macro / Label
     # optics / acquisition
     objective: Optional[str] = None # potentiall SlideInfo
-    bf_lamp_type: Optional[str] = None
+    bf_lamp_type: Optional[str] = None  # brightfield lamp, root <BFLampType>
+    lamp_type: Optional[str] = None  # fluorescence excitation lamp, root <LampType>
     scan_profile_name: Optional[str] = None
     scan_mode: Optional[str] = None
     is_tma: Optional[bool] = None # qptiff specific; most probably a qpi metadata
     opal_kit_type: Optional[str] = None
+    scale_factor: Optional[float] = None  # nominal pyramid downsample, root <ScaleFactor>  # noqa: E501
+    # ScanProfile acquisition settings (Polaris/Fusion <ScanProfile><root>)
+    compression: Optional[str] = None  # <Compression> e.g. "LZW"
+    jpeg_quality: Optional[int] = None  # <JPEGQuality>
+    saturation_protection_type: Optional[str] = None  # <SaturationProtectionType>
+    coverslip_thickness: Optional[str] = None  # <CoverslipThickness>
+    is_rna: Optional[bool] = None  # <IsRNA> — RNAscope-style assay flag
+    # camera orientation flags (<ScanProfile><root><CameraSettings>)
+    rotate_image: Optional[bool] = None  # <RotateImage>
+    mirror_image: Optional[bool] = None  # <MirrorImage>
     # stage position of this image
     xposition_um: Optional[float] = None
     yposition_um: Optional[float] = None
@@ -146,6 +159,8 @@ class ChannelInfo:
     # Additional per-channel fields present in Fusion 1.x page XMLs
     objective: Optional[str] = None
     autofluorescence_subtracted: Optional[bool] = None
+    # Polaris ScanBands-i auto-exposure mode, e.g. "aet_Fluorescence"
+    auto_expose_type: Optional[str] = None
     responsivity: Optional[float] = None
     responsivity_filter_id: Optional[str] = None
     responsivity_date: Optional[str] = None
