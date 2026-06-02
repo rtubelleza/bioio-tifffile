@@ -374,10 +374,54 @@ def _populate_channel_fields_from_element(
         _set_if(fields, "binning", _int(elem.find(".//Binning")))
 
 
-def _parse_brightfield_channels(n_samples: int) -> List[ChannelInfo]:
-    """For brightfield RGB images, return R/G/B channel descriptors."""
-    names = ["Red", "Green", "Blue"] if n_samples == 3 else [f"Sample_{i}" for i in range(n_samples)]
-    return [ChannelInfo(index=i, name=names[i], is_brightfield=True) for i in range(n_samples)]
+def _parse_brightfield_channels(
+    n_samples: int, root: Optional[ET.Element] = None
+) -> List[ChannelInfo]:
+    """For brightfield RGB images, return R/G/B channel descriptors.
+
+    The RGB samples are a single acquisition, so the image-root ``ExposureTime`` /
+    ``SignalUnits`` / ``Objective`` / ``IsUnmixedComponent`` and ``CameraSettings``
+    (gain, bit depth, binning, offset, orientation, ROI) apply equally to every
+    sample. Pull them in so brightfield channels carry the same per-channel
+    metadata as fluorescence ones rather than bare names.
+
+    Only *direct* children of ``root`` are read: the deep ``<ScanProfile>`` filter
+    config (HomeWavelength, TransmissionBands, ...) describes the tunable-filter
+    hardware, not the RGB samples, and must not leak onto the channels.
+    """
+    names = (
+        ["Red", "Green", "Blue"]
+        if n_samples == 3
+        else [f"Sample_{i}" for i in range(n_samples)]
+    )
+    shared: Dict[str, object] = {}
+    if root is not None:
+        et = _text(root.find("ExposureTime"))
+        if et is not None:
+            try:
+                shared["exposure_time_us"] = float(et)
+            except ValueError:
+                pass
+        _set_if(shared, "signal_units", _int(root.find("SignalUnits")))
+        _set_if(shared, "is_unmixed_component", _bool(root.find("IsUnmixedComponent")))
+        _set_if(shared, "objective", _text(root.find("Objective")))
+        cs = root.find("CameraSettings")
+        if cs is not None:
+            _set_if(shared, "gain", _float(cs.find("Gain")))
+            _set_if(shared, "binning", _int(cs.find("Binning")))
+            _set_if(shared, "bit_depth", _int(cs.find("BitDepth")))
+            _set_if(shared, "offset_counts", _int(cs.find("OffsetCounts")))
+            _set_if(shared, "camera_orientation", _text(cs.find("Orientation")))
+            roi = cs.find("ROI")
+            if roi is not None:
+                _set_if(shared, "roi_x", _int(roi.find("X")))
+                _set_if(shared, "roi_y", _int(roi.find("Y")))
+                _set_if(shared, "roi_width", _int(roi.find("Width")))
+                _set_if(shared, "roi_height", _int(roi.find("Height")))
+    return [
+        ChannelInfo(index=i, name=names[i], is_brightfield=True, **shared)  # type: ignore[arg-type]
+        for i in range(n_samples)
+    ]
 
 
 def _parse_fluorescence_channels(
@@ -548,7 +592,7 @@ def parse_qpi_xml(
 
     if fmt == FORMAT_BRIGHTFIELD:
         n = n_channels if n_channels and n_channels > 0 else 3
-        channels = _parse_brightfield_channels(n)
+        channels = _parse_brightfield_channels(n, root)
 
     elif fmt == FORMAT_POLARIS_SCANBAND:
         # Newer "paged Polaris" files (Polaris/PhenoCycler, Fusion 2.x) carry the

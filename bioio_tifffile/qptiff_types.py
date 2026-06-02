@@ -103,6 +103,9 @@ class ImageInfo:
     """
 
     image_type: Optional[str] = None  # FullResolution / Thumbnail / Macro / Label
+    # stored pixel precision: TIFF tag 258 BitsPerSample (8 for 8-bit RGB H&E,
+    # 16 for fluorescence). Distinct from camera.bit_depth (the ADC depth).
+    stored_bits_per_sample: Optional[int] = None
     # optics / acquisition
     objective: Optional[str] = None # potentiall SlideInfo
     bf_lamp_type: Optional[str] = None  # brightfield lamp, root <BFLampType>

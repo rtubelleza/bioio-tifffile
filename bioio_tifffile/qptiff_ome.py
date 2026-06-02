@@ -294,6 +294,7 @@ def ome_metadata_from_qptiff(
         ("is_tma", _str(qpi.is_tma)),
         ("opal_kit_type", qpi.opal_kit_type),
         ("acquisition_format", qpi.acquisition_format),
+        ("stored_bits_per_sample", _str(ii.stored_bits_per_sample)),
         ("scale_factor", _str(ii.scale_factor)),
         ("compression", ii.compression),
         ("jpeg_quality", _str(ii.jpeg_quality)),

@@ -1020,6 +1020,16 @@ class Reader(reader.Reader):
             if isinstance(ypos, tuple) and len(ypos) == 2 and ypos[1]:
                 img_info.yposition_um = scalar * ypos[0] / ypos[1]
 
+        # stored pixel precision from TIFF tag 258 BitsPerSample. RGB stores a
+        # (8, 8, 8) tuple, single-sample an int; the samples share one depth so
+        # we keep the first. Distinct from camera.bit_depth (the ADC depth).
+        _TIFF_BITSPERSAMPLE = 258
+        bps = tiff_tags.get(_TIFF_BITSPERSAMPLE)
+        if isinstance(bps, (tuple, list)) and bps:
+            bps = bps[0]
+        if isinstance(bps, int):
+            meta._primary.image_info.stored_bits_per_sample = int(bps)
+
         attrs = qptiff_meta_to_root_attrs(meta)
 
         if series is not None:
