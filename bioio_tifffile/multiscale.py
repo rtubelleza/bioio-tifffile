@@ -13,6 +13,7 @@ with `level`, `dims`, `scale_factors`, and `pixel_size_um`.
 from __future__ import annotations
 
 import typing
+from dataclasses import fields as dataclass_fields
 
 import multiscale_spatial_image  # registers the .msi accessor on xr.DataTree
 import numpy as np
@@ -22,27 +23,10 @@ from .qptiff_types import ChannelInfo
 
 _UPPER_TO_LOWER = {"C": "c", "S": "c", "Y": "y", "X": "x", "Z": "z", "T": "t"}
 
-# ChannelInfo fields to promote as per-channel xarray coordinates.
-# color_rgb tuples are converted to "#rrggbb" hex strings for JSON safety.
-_CHANNEL_COORD_FIELDS = [
-    "fluorophore",
-    "exposure_time_us",
-    "emission_wavelength_nm",
-    "excitation_wavelength_nm",
-    "is_brightfield",
-    "color_rgb",
-    "is_unmixed_component",
-    "gain",
-    "binning",
-    "bit_depth",
-    "excitation_filter_name",
-    "emission_filter_name",
-    "excitation_filter_manufacturer",
-    "emission_filter_manufacturer",
-    "responsivity",
-    "autofluorescence_subtracted",
-    "signal_units",
-]
+# Per-channel coords are derived from *every* ChannelInfo field (so the set stays
+# in sync as the schema grows) except these: ``index`` is positional and ``name``
+# is the channel-dim coord itself. color_rgb tuples are serialised to "#rrggbb".
+_CHANNEL_COORD_SKIP = {"index", "name"}
 
 
 def channel_infos_to_coords(
@@ -51,15 +35,19 @@ def channel_infos_to_coords(
 ) -> typing.Dict[str, typing.Any]:
     """Build xarray coords from a list of ChannelInfo objects.
 
-    The primary ``channel_dim`` coordinate holds channel names. Additional
-    per-channel fields from ``_CHANNEL_COORD_FIELDS`` are attached when at
-    least one channel has a non-None value. ``color_rgb`` tuples are
+    The primary ``channel_dim`` coordinate holds channel names. Every other
+    ``ChannelInfo`` field (see ``_CHANNEL_COORD_SKIP``) is attached as a coord
+    when at least one channel has a non-None value. ``color_rgb`` tuples are
     serialised as ``"#rrggbb"`` hex strings.
     """
     coords: typing.Dict[str, typing.Any] = {}
     coords[channel_dim] = xr.Variable(channel_dim, [ch.name for ch in channel_infos])
 
-    for field in _CHANNEL_COORD_FIELDS:
+    field_names = [
+        f.name for f in dataclass_fields(ChannelInfo)
+        if f.name not in _CHANNEL_COORD_SKIP
+    ]
+    for field in field_names:
         raw = [getattr(ch, field, None) for ch in channel_infos]
         if not any(v is not None for v in raw):
             continue
