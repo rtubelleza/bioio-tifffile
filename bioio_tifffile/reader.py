@@ -23,6 +23,7 @@ from .qptiff_zarr import write_ome_zarr as _write_ome_zarr
 from .qptiff_metadata import (
     ChannelInfo,
     QptiffMetadata,
+    SlideInfo,
     extract_datetime_from_page,
     ome_metadata_from_qptiff,
     parse_qpi_xml,
@@ -989,6 +990,7 @@ class Reader(reader.Reader):
         """
         nodes: typing.Dict[str, xr.Dataset] = {}
         seen: typing.Dict[str, int] = {}
+        slide_info: typing.Optional[SlideInfo] = None  # slide-scoped, root-level
 
         for series_idx, series in enumerate(tiff.series):
             is_qpi = valid_qpi_series(series.pages)
@@ -1000,6 +1002,10 @@ class Reader(reader.Reader):
                     code: tag.value for code, tag in series.pages[0].tags.items()
                 }
                 base_attrs = self._build_attrs(tiff_tags, meta, series)
+                # SlideInfo is slide-constant; capture the FullResolution series'
+                # copy (parsed first) as the canonical root-level slide metadata.
+                if slide_info is None or name == FULL_RESOLUTION_TYPE:
+                    slide_info = meta.slide
             else:
                 meta = None
                 name = generate_ome_image_id(series_idx)
@@ -1055,10 +1061,22 @@ class Reader(reader.Reader):
                 ds.attrs = {**dict(sub.attrs), **dict(ds.attrs)}
                 nodes[name] = ds
 
+            # Scope `processed` to this level: a scene node carries only its own
+            # QptiffImageSceneMetadata (image_info + channels + scales), not the
+            # whole QptiffMetadata. SlideInfo is slide-constant and lives on the
+            # root node (below), so drop the per-scene slide_info copy.
+            nodes[name].attrs.pop("slide_info", None)
             if meta is not None:
-                nodes[name].attrs[constants.METADATA_PROCESSED] = meta
+                nodes[name].attrs[constants.METADATA_PROCESSED] = meta._primary
 
-        return xr.DataTree.from_dict(nodes)
+        dt = xr.DataTree.from_dict(nodes)
+        # SlideInfo sits at the same level as the scenes — on the root node.
+        if slide_info is not None:
+            from dataclasses import asdict
+
+            dt.attrs["slide_info"] = asdict(slide_info)
+            dt.attrs[constants.METADATA_PROCESSED] = slide_info
+        return dt
 
     def _build_multiscale_datatree(self, tiff: TiffFile, *, lazy: bool) -> xr.DataTree:
         tiff_series_idx = self._tiff_series_index(self.current_scene_index)
