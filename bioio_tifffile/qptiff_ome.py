@@ -296,6 +296,7 @@ def ome_metadata_from_qptiff(
         ("acquisition_format", qpi.acquisition_format),
         ("stored_bits_per_sample", _str(ii.stored_bits_per_sample)),
         ("scale_factor", _str(ii.scale_factor)),
+        ("scale_factor_unit", ii.scale_factor_unit),
         ("compression", ii.compression),
         ("jpeg_quality", _str(ii.jpeg_quality)),
         ("saturation_protection_type", ii.saturation_protection_type),

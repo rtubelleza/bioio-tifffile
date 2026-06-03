@@ -49,11 +49,11 @@ class ScanResolutionInfo:
     magnification: Optional[float] = None
     objective_name: Optional[str] = None
     binning: Optional[int] = None
+    #: DEPRECATED: micron-specific. Use the unit-agnostic
+    #: ``ImageInfo.scale_factor`` + ``ImageInfo.scale_factor_unit`` instead, which
+    #: carry the full-resolution pixel->physical scale and its unit as declared by
+    #: the source metadata. Kept (still populated) only for backward compatibility.
     base_pixel_size_um: Optional[float] = None
-    # explicit unit for base_pixel_size_um (always ASCII "um" — the QPI
-    # <PixelSizeMicrons> is microns by definition; set only when base_pixel_size_um
-    # is known). ASCII "um" (not "µm") keeps it easy to string-query/filter.
-    pixel_size_unit: Optional[str] = None
 
 
 @dataclass
@@ -118,7 +118,14 @@ class ImageInfo:
     scan_mode: Optional[str] = None
     is_tma: Optional[bool] = None # qptiff specific; most probably a qpi metadata
     opal_kit_type: Optional[str] = None
-    scale_factor: Optional[float] = None  # nominal pyramid downsample, root <ScaleFactor>  # noqa: E501
+    # Full-resolution pixel -> physical scaling of THIS image (value only; one per
+    # image, NOT per pyramid level). A pyramid level's physical pixel size is
+    # inferred as scale_factor * (that level's downsample factor). Unit-agnostic:
+    # the unit lives in scale_factor_unit.
+    scale_factor: Optional[float] = None
+    # physical unit of scale_factor, as declared by the source metadata (e.g. "um"
+    # for QPI <PixelSizeMicrons>). ASCII (not "µm") to stay query-friendly.
+    scale_factor_unit: Optional[str] = None
     # ScanProfile acquisition settings (Polaris/Fusion <ScanProfile><root>)
     compression: Optional[str] = None  # <Compression> e.g. "LZW"
     jpeg_quality: Optional[int] = None  # <JPEGQuality>

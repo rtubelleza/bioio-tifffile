@@ -1173,6 +1173,27 @@ class Reader(reader.Reader):
         if isinstance(bps, int):
             meta._primary.image_info.stored_bits_per_sample = int(bps)
 
+        # scale_factor fallback for scenes whose QPI XML lacks <PixelSizeMicrons>
+        # (Label / Macro / Overview / Thumbnail): every TIFF page still defines a
+        # pixel->physical scale via XResolution (tag 282) + ResolutionUnit (296).
+        # XML keeps precedence (FullResolution already set in parse_qpi_xml).
+        img_info = meta._primary.image_info
+        if img_info.scale_factor is None:
+            xres = tiff_tags.get(282)  # (numerator, denominator): pixels per unit
+            resunit = tiff_tags.get(296)
+            if (
+                isinstance(xres, tuple)
+                and len(xres) == 2
+                and xres[0]
+                and resunit not in (None, tifffile.RESUNIT.NONE)
+            ):
+                scalar = _NAME_TO_MICRONS.get(resunit)
+                if scalar:
+                    px_um = scalar * xres[1] / xres[0]
+                    if px_um > 0:
+                        img_info.scale_factor = px_um
+                        img_info.scale_factor_unit = "um"
+
         attrs = qptiff_meta_to_root_attrs(meta)
 
         if series is not None:

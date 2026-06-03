@@ -111,13 +111,8 @@ def _parse_scan_resolution(root: ET.Element) -> ScanResolutionInfo:
     if sr is None:
         return ScanResolutionInfo()
 
-    base_px = _float(sr.find("PixelSizeMicrons"))
     return ScanResolutionInfo(
-        base_pixel_size_um=base_px,
-        # <PixelSizeMicrons> is microns by definition; record the unit explicitly
-        # so downstream consumers don't rely on the field name alone. Use ASCII
-        # "um" (not "µm") so it's easy to string-query/filter.
-        pixel_size_unit="um" if base_px is not None else None,
+        base_pixel_size_um=_float(sr.find("PixelSizeMicrons")),
         magnification=_float(sr.find("Magnification")),
         objective_name=_text(sr.find("ObjectiveName")),
         binning=_int(sr.find("Binning")),
@@ -558,7 +553,6 @@ def parse_qpi_xml(
     image_info.bf_lamp_type = _text(root.find("BFLampType"))
     image_info.lamp_type = _text(root.find("LampType"))
     image_info.objective = _text(root.find("Objective"))
-    image_info.scale_factor = _float(root.find("ScaleFactor"))
 
     sp = root.find("ScanProfile")
     if sp is not None:
@@ -582,6 +576,14 @@ def parse_qpi_xml(
             image_info.mirror_image = _bool(cam.find("MirrorImage"))
 
     image_info.scan_resolution = _parse_scan_resolution(root)
+
+    # Canonical full-res pixel -> physical scale (unit-agnostic). The QPI XML
+    # declares it as <PixelSizeMicrons>, i.e. microns, so the unit is "um".
+    # (Supersedes the deprecated scan_resolution.base_pixel_size_um.)
+    base_px = image_info.scan_resolution.base_pixel_size_um
+    if base_px is not None:
+        image_info.scale_factor = base_px
+        image_info.scale_factor_unit = "um"
 
     # Fusion 1.x stores ScanProfile as a JSON blob; fill any still-missing
     # fields from it. Done after _parse_scan_resolution so XML-form values
