@@ -109,7 +109,9 @@ def compute_scale_attrs(
     """
     Build the per-level attrs describing this scale's relationship to scale0.
 
-    `scale_factors` is [sy, sx] relative to level 0 (so [1.0, 1.0] at scale0).
+    `downsample_factor` is the scalar pyramid reduction vs level 0 — 1.0 at scale0
+    and for any non-pyramidal (single-level) image, 2.0 at the next level, etc.
+    `scale_factors` is the per-axis [sy, sx] form (kept for back-compat).
     `pixel_size_um` is the absolute pixel size at this level (if known).
     """
     y0, x0 = level0_shape_yx
@@ -120,6 +122,9 @@ def compute_scale_attrs(
     attrs: typing.Dict[str, typing.Any] = {
         "level": level_idx,
         "dims": ["y", "x"],
+        # scalar downsample vs full-res (1.0 at scale0 / non-pyramidal images).
+        # QPTIFF pyramids are isotropic (sy == sx); use the y-axis factor.
+        "downsample_factor": sy,
         "scale_factors": [sy, sx],
     }
     if pixel_size_yx_um is not None:
