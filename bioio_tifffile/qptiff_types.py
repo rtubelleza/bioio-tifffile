@@ -50,6 +50,9 @@ class ScanResolutionInfo:
     objective_name: Optional[str] = None
     binning: Optional[int] = None
     base_pixel_size_um: Optional[float] = None
+    # explicit unit for base_pixel_size_um (always "µm" — the QPI <PixelSizeMicrons>
+    # is microns by definition; set only when base_pixel_size_um is known).
+    pixel_size_unit: Optional[str] = None
 
 
 @dataclass
