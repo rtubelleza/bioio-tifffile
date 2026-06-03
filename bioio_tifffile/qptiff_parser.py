@@ -115,8 +115,9 @@ def _parse_scan_resolution(root: ET.Element) -> ScanResolutionInfo:
     return ScanResolutionInfo(
         base_pixel_size_um=base_px,
         # <PixelSizeMicrons> is microns by definition; record the unit explicitly
-        # so downstream consumers don't rely on the field name alone.
-        pixel_size_unit="µm" if base_px is not None else None,
+        # so downstream consumers don't rely on the field name alone. Use ASCII
+        # "um" (not "µm") so it's easy to string-query/filter.
+        pixel_size_unit="um" if base_px is not None else None,
         magnification=_float(sr.find("Magnification")),
         objective_name=_text(sr.find("ObjectiveName")),
         binning=_int(sr.find("Binning")),
