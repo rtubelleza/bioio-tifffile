@@ -316,8 +316,11 @@ class Reader(reader.Reader):
 
         return "".join(best_guess)
 
-    def _guess_tiff_dim_order(self, tiff: TiffFile) -> typing.List[str]:
-        tiff_series_idx = self._tiff_series_index(self.current_scene_index)
+    def _guess_tiff_dim_order(
+        self, tiff: TiffFile, tiff_series_idx: typing.Optional[int] = None
+    ) -> typing.List[str]:
+        if tiff_series_idx is None:
+            tiff_series_idx = self._tiff_series_index(self.current_scene_index)
         scene = tiff.series[tiff_series_idx]
         dims_from_meta = scene.pages.axes
 
@@ -934,6 +937,128 @@ class Reader(reader.Reader):
         with self._fs.open(self._path) as open_resource:
             with TiffFile(open_resource, is_mmstack=False) as tiff:
                 return self._build_multiscale_datatree(tiff, lazy=False)
+
+    # qptiff
+    @property
+    def xarray_dask_scene_datatree(self) -> xr.DataTree:
+        """
+        Lazy DataTree whose top-level nodes are the image scenes of the file.
+
+        Unlike :attr:`xarray_dask_datatree_data` (the *active* scene only, with
+        ``scale0``/``scale1``/... at the root), this returns **every** QPI image
+        scene (``FullResolution``, ``Label``, ``Macro``, ``Thumbnail``, ...) in a
+        single tree, regardless of the ``include_aux_series`` flag::
+
+            root
+            ├── FullResolution/      (pyramidal -> scale sub-tree)
+            │   ├── scale0   (image)
+            │   ├── scale1
+            │   └── ...
+            ├── Label        (single image -> holds `image` directly)
+            ├── Macro
+            └── Thumbnail
+
+        A pyramidal scene becomes an inner node with ``scale0..N`` children; a
+        single-resolution scene is a leaf node holding the ``image`` data variable
+        directly. Per-scene ``slide_info`` / ``image_info`` / ``processed`` live on
+        the scene node's attrs; per-channel coords ride on each ``image``.
+        """
+        with self._fs.open(self._path) as open_resource:
+            with TiffFile(open_resource, is_mmstack=False) as tiff:
+                return self._build_scene_datatree(tiff, lazy=True)
+
+    # qptiff
+    @property
+    def xarray_scene_datatree(self) -> xr.DataTree:
+        """
+        In-memory variant of :attr:`xarray_dask_scene_datatree` (each level is
+        materialised as a numpy array at call time).
+        """
+        with self._fs.open(self._path) as open_resource:
+            with TiffFile(open_resource, is_mmstack=False) as tiff:
+                return self._build_scene_datatree(tiff, lazy=False)
+
+    # qptiff
+    def _build_scene_datatree(self, tiff: TiffFile, *, lazy: bool) -> xr.DataTree:
+        """Assemble a scene-keyed DataTree from every image series in the file.
+
+        Parameterised by series index (no ``current_scene_index`` mutation), so
+        it reuses the per-scene array / coord / attr machinery for each series in
+        turn. Pyramidal series get ``<scene>/scale0..N`` nodes; single series get
+        a ``<scene>`` leaf holding ``image`` directly.
+        """
+        nodes: typing.Dict[str, xr.Dataset] = {}
+        seen: typing.Dict[str, int] = {}
+
+        for series_idx, series in enumerate(tiff.series):
+            is_qpi = valid_qpi_series(series.pages)
+            if is_qpi:
+                meta = self._get_or_parse_meta(series_idx, series)
+                name = meta.image_type or f"Series_{series_idx}"
+                channel_infos = meta.channels or None
+                tiff_tags = {
+                    code: tag.value for code, tag in series.pages[0].tags.items()
+                }
+                base_attrs = self._build_attrs(tiff_tags, meta, series)
+            else:
+                meta = None
+                name = generate_ome_image_id(series_idx)
+                channel_infos = None
+                base_attrs = {}
+
+            # de-duplicate repeated image types (e.g. two Macro series)
+            count = seen.get(name, 0)
+            seen[name] = count + 1
+            if count:
+                name = f"{name}_{count}"
+
+            dims = self._guess_tiff_dim_order(tiff, series_idx)
+
+            pixel_size_yx_um: typing.Optional[typing.Tuple[float, float]] = None
+            if meta is not None and meta.pixel_size_um is not None:
+                pixel_size_yx_um = (float(meta.pixel_size_um), float(meta.pixel_size_um))
+
+            n_levels = len(getattr(series, "levels", [series]))
+            level_arrays: typing.List[xr.DataArray] = []
+            channel_names_ref: typing.Optional[typing.List[str]] = None
+            for level_idx in range(n_levels):
+                if lazy:
+                    data = self._create_dask_array_for_level(
+                        tiff, dims, series_idx, level_idx
+                    )
+                else:
+                    data = series.levels[level_idx].asarray()
+                if channel_names_ref is None:
+                    channel_names_ref = self._get_channel_names_for_scene(
+                        data.shape, dims, channel_infos=channel_infos
+                    )
+                arr = squeeze_to_cyx(xr.DataArray(data, dims=dims))
+                level_arrays.append(arr)
+
+            sub = build_datatree_from_levels(
+                levels_arrays=level_arrays,
+                pixel_size_yx_um=pixel_size_yx_um,
+                base_attrs=base_attrs,
+                channel_infos=channel_infos,
+                channel_names=channel_names_ref,
+            )
+
+            if n_levels > 1:
+                # pyramidal: scene becomes an inner node with scale children.
+                nodes[name] = xr.Dataset(attrs=dict(sub.attrs))
+                for child_name, child in sub.children.items():
+                    nodes[f"{name}/{child_name}"] = child.to_dataset()
+            else:
+                # single image: scene is a leaf holding `image` directly, with
+                # the scene-level attrs merged onto it.
+                ds = sub["scale0"].to_dataset()
+                ds.attrs = {**dict(sub.attrs), **dict(ds.attrs)}
+                nodes[name] = ds
+
+            if meta is not None:
+                nodes[name].attrs[constants.METADATA_PROCESSED] = meta
+
+        return xr.DataTree.from_dict(nodes)
 
     def _build_multiscale_datatree(self, tiff: TiffFile, *, lazy: bool) -> xr.DataTree:
         tiff_series_idx = self._tiff_series_index(self.current_scene_index)
