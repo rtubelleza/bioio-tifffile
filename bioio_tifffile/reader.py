@@ -1049,16 +1049,26 @@ class Reader(reader.Reader):
                 channel_names=channel_names_ref,
             )
 
+            # Image-scoped metadata rides on the `image` DataArray itself (like
+            # the per-channel coords already do), so a sliced-out image is
+            # self-describing: `image_info` dict + the scene's
+            # QptiffImageSceneMetadata under `processed`.
+            image_info = dict(sub.attrs.get("image_info", {})) or None
+            scene_meta = meta._primary if meta is not None else None
+
             if n_levels > 1:
                 # pyramidal: scene becomes an inner node with scale children.
                 nodes[name] = xr.Dataset(attrs=dict(sub.attrs))
                 for child_name, child in sub.children.items():
-                    nodes[f"{name}/{child_name}"] = child.to_dataset()
+                    cds = child.to_dataset()
+                    _stamp_image_metadata(cds, image_info, scene_meta)
+                    nodes[f"{name}/{child_name}"] = cds
             else:
                 # single image: scene is a leaf holding `image` directly, with
                 # the scene-level attrs merged onto it.
                 ds = sub["scale0"].to_dataset()
                 ds.attrs = {**dict(sub.attrs), **dict(ds.attrs)}
+                _stamp_image_metadata(ds, image_info, scene_meta)
                 nodes[name] = ds
 
             # Scope `processed` to this level: a scene node carries only its own
@@ -1066,8 +1076,8 @@ class Reader(reader.Reader):
             # whole QptiffMetadata. SlideInfo is slide-constant and lives on the
             # root node (below), so drop the per-scene slide_info copy.
             nodes[name].attrs.pop("slide_info", None)
-            if meta is not None:
-                nodes[name].attrs[constants.METADATA_PROCESSED] = meta._primary
+            if scene_meta is not None:
+                nodes[name].attrs[constants.METADATA_PROCESSED] = scene_meta
 
         dt = xr.DataTree.from_dict(nodes)
         # SlideInfo sits at the same level as the scenes — on the root node.
@@ -1262,6 +1272,26 @@ class Reader(reader.Reader):
             validate=validate,
             **kwargs,
         )
+
+
+def _stamp_image_metadata(
+    ds: xr.Dataset,
+    image_info: typing.Optional[typing.Dict[str, typing.Any]],
+    scene_meta: typing.Any,  # QptiffImageSceneMetadata (meta._primary)
+) -> None:
+    """Attach image-scoped metadata onto a dataset's ``image`` DataArray attrs.
+
+    Keeps the image self-describing when sliced out of the scene DataTree: the
+    ``image_info`` dict and the scene's ``QptiffImageSceneMetadata`` ride on the
+    array alongside the per-channel coords already present.
+    """
+    if "image" not in ds.data_vars:
+        return
+    img = ds["image"]
+    if image_info is not None:
+        img.attrs["image_info"] = image_info
+    if scene_meta is not None:
+        img.attrs[constants.METADATA_PROCESSED] = scene_meta
 
 
 _NAME_TO_MICRONS = {
