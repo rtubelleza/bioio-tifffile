@@ -20,8 +20,42 @@ Organised to resemble ome-ngff hierarchies:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+import json
+from dataclasses import asdict, dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
+
+
+def _strip_key(obj: Any, key: str) -> None:
+    """Recursively remove ``key`` from nested dicts/lists (in place)."""
+    if isinstance(obj, dict):
+        obj.pop(key, None)
+        for v in obj.values():
+            _strip_key(v, key)
+    elif isinstance(obj, (list, tuple)):
+        for v in obj:
+            _strip_key(v, key)
+
+
+class JsonReprMixin:
+    """Gives every metadata dataclass a JSON-/dict-serializable representation.
+
+    xarray / zarr attrs cannot store arbitrary Python objects, so anything that
+    ends up in ``DataArray.attrs`` (e.g. the ``processed`` metadata) must be a
+    plain dict. ``to_dict`` recurses through nested dataclasses and lists; the
+    bulky ``raw_xml`` is dropped by default (it is the unparsed source, redundant
+    with the structured fields, and tens of KB).
+    """
+
+    def to_dict(self, include_raw_xml: bool = False) -> Dict[str, Any]:
+        d = asdict(self)  # recursive over nested dataclasses / lists
+        if not include_raw_xml:
+            _strip_key(d, "raw_xml")
+        return d
+
+    def to_json(self, *, include_raw_xml: bool = False, **kwargs: Any) -> str:
+        return json.dumps(
+            self.to_dict(include_raw_xml=include_raw_xml), default=str, **kwargs
+        )
 
 #: H&E / IHC brightfield scan. scan_mode contains "Brightfield" or BFLampType
 #: is present. Channels are RGB samples stored in the S dimension.
@@ -40,7 +74,7 @@ FORMAT_UNKNOWN = "unknown"
 
 
 @dataclass
-class ScanResolutionInfo:
+class ScanResolutionInfo(JsonReprMixin):
     """Objective/scan settings that apply to the whole scene.
 
     ``base_pixel_size_um`` is the physical pixel size of the full resolution page (scale0).
@@ -57,7 +91,7 @@ class ScanResolutionInfo:
 
 
 @dataclass
-class CameraInfo:
+class CameraInfo(JsonReprMixin):
     """Camera / detector settings for the whole scene.
 
     Fusion 1.x embeds ``<CameraSettings>`` in every page XML; in practice the
@@ -75,7 +109,7 @@ class CameraInfo:
 
 
 @dataclass
-class SlideInfo:
+class SlideInfo(JsonReprMixin):
     """Physical-slide identity. Usually constant across every image on this slide."""
 
     slide_id: Optional[str] = None
@@ -93,7 +127,7 @@ class SlideInfo:
 
 
 @dataclass
-class ImageInfo:
+class ImageInfo(JsonReprMixin):
     """Metadata for a given image scene.
 
     For qptiffs;
@@ -144,7 +178,7 @@ class ImageInfo:
 
 
 @dataclass
-class ChannelInfo:
+class ChannelInfo(JsonReprMixin):
     """Canonical metadata for a single image channel.
 
     This defines variables along the "c"/"channel" axis. 
@@ -195,7 +229,7 @@ class ChannelInfo:
 
 
 @dataclass
-class ScaleInfo:
+class ScaleInfo(JsonReprMixin):
     """Image metadata which changes with pyramidal scale.
 
     ``dims`` names each spatial axis (e.g. ``["y", "x"]``).  ``downsample_factors``
@@ -217,7 +251,7 @@ class ScaleInfo:
     pixel_sizes_um: List[float] = field(default_factory=list)
 
 @dataclass
-class QptiffImageSceneMetadata:
+class QptiffImageSceneMetadata(JsonReprMixin):
     """Metadata for one logical image from a QPTIFF (FullRes / Label / Macro / Thumbnail).
 
     Metadata-only.
@@ -249,7 +283,7 @@ class QptiffImageSceneMetadata:
 
 
 @dataclass
-class QptiffMetadata:
+class QptiffMetadata(JsonReprMixin):
     """
     Structured metadata extracted from a PerkinElmer QPI QPTIFF file,
     across each image scenes, dimensions and scales (if multiscale).

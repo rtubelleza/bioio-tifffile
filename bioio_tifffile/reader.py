@@ -1054,7 +1054,8 @@ class Reader(reader.Reader):
             # self-describing: `image_info` dict + the scene's
             # QptiffImageSceneMetadata under `processed`.
             image_info = dict(sub.attrs.get("image_info", {})) or None
-            scene_meta = meta._primary if meta is not None else None
+                # dict form (not the object) so it serialises into xarray/zarr attrs
+            scene_meta = meta._primary.to_dict() if meta is not None else None
 
             if n_levels > 1:
                 # pyramidal: scene becomes an inner node with scale children.
@@ -1085,7 +1086,7 @@ class Reader(reader.Reader):
             from dataclasses import asdict
 
             dt.attrs["slide_info"] = asdict(slide_info)
-            dt.attrs[constants.METADATA_PROCESSED] = slide_info
+            dt.attrs[constants.METADATA_PROCESSED] = slide_info.to_dict()
         return dt
 
     def _build_multiscale_datatree(self, tiff: TiffFile, *, lazy: bool) -> xr.DataTree:
@@ -1138,16 +1139,12 @@ class Reader(reader.Reader):
             channel_names=channel_names_ref,
         )
 
-        # Retain the parsed QptiffMetadata object on the root attrs for parity
-        # with the single DataArray path (so attrs[METADATA_PROCESSED] is the
-        # same object on both). build_datatree_from_levels drops it because
-        # _sanitise_attrs keeps only JSON-safe types for a clean serialisable
-        # tree; re-attach it here. The zarr writer builds its own .zattrs from
-        # the OME object and never serialises the root attrs, so this does not
-        # affect write_ome_zarr output. (A direct dt.to_zarr() would need it
-        # stripped, but the supported write paths do not call that.)
+        # Re-attach the parsed metadata on the root attrs for parity with the
+        # single DataArray path. Stored as a dict (meta.to_dict()) — not the
+        # object — so the tree is fully serialisable to zarr. The live object is
+        # always available via reader.qpi_metadata.
         if meta is not None:
-            dt.attrs[constants.METADATA_PROCESSED] = meta
+            dt.attrs[constants.METADATA_PROCESSED] = meta.to_dict()
         return dt
 
     # qptiff
@@ -1223,7 +1220,9 @@ class Reader(reader.Reader):
             for code, value in tiff_tags.items()
             if code not in _UNPROCESSED_TAG_EXCLUDE
         }
-        attrs[constants.METADATA_PROCESSED] = meta
+        # dict form so attrs are JSON/zarr-serialisable; the live QptiffMetadata
+        # object remains available via reader.qpi_metadata.
+        attrs[constants.METADATA_PROCESSED] = meta.to_dict()
 
         return attrs
 
@@ -1277,13 +1276,14 @@ class Reader(reader.Reader):
 def _stamp_image_metadata(
     ds: xr.Dataset,
     image_info: typing.Optional[typing.Dict[str, typing.Any]],
-    scene_meta: typing.Any,  # QptiffImageSceneMetadata (meta._primary)
+    scene_meta: typing.Optional[typing.Dict[str, typing.Any]],  # QptiffImageSceneMetadata.to_dict()  # noqa: E501
 ) -> None:
     """Attach image-scoped metadata onto a dataset's ``image`` DataArray attrs.
 
     Keeps the image self-describing when sliced out of the scene DataTree: the
-    ``image_info`` dict and the scene's ``QptiffImageSceneMetadata`` ride on the
-    array alongside the per-channel coords already present.
+    ``image_info`` dict and the scene's QptiffImageSceneMetadata (as a dict) ride
+    on the array alongside the per-channel coords already present. Both are plain
+    dicts so the array serialises to zarr.
     """
     if "image" not in ds.data_vars:
         return
