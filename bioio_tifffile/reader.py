@@ -178,6 +178,13 @@ class Reader(reader.Reader):
         self._ome_only: bool = bool(
             kwargs.get("ome_metadata", _rk.get("ome_metadata", False))
         )
+        # Logical dask chunk along spatial dims for the lazy (tiled) datatree
+        # reader. Larger -> fewer chunks (faster graph build, slightly larger
+        # region reads); smaller -> tighter reads, bigger graphs. See
+        # _create_tiled_dask_array_for_level.
+        self._tile_target: int = int(
+            kwargs.get("tile_target", _rk.get("tile_target", self._DEFAULT_TILE_TARGET))
+        )
         self._qpi_meta_cache = {}
         self._ome_cache = {}
 
@@ -540,6 +547,46 @@ class Reader(reader.Reader):
         image_data = da.transpose(image_data, tuple(transpose_indices))
 
         return image_data
+
+    # Default logical dask chunk along spatial dims for the tiled reader. 
+    _DEFAULT_TILE_TARGET = 2048
+
+    def _create_tiled_dask_array_for_level(
+        self,
+        tiff: TiffFile,
+        selected_scene_dims_list: typing.List[str],
+        tiff_series_idx: int,
+        level_idx: int,
+        tile_target: typing.Optional[int] = None,
+    ) -> da.Array:
+        """Tile-grained, lazily-sliceable dask array for one (series, level).
+
+        """
+        selected_scene_dims = "".join(selected_scene_dims_list)
+        level_series = tiff.series[tiff_series_idx].levels[level_idx]
+        if len(level_series.shape) != len(selected_scene_dims):
+            raise exceptions.ConflictingArgumentsError(
+                f"Dimension string provided does not match the number of "
+                f"dimensions found for this scene. This scene shape: "
+                f"{level_series.shape}, Provided dims string: {selected_scene_dims}"
+            )
+
+        store = imread(
+            self._path,
+            aszarr=True,
+            series=tiff_series_idx,
+            level=level_idx,
+        )
+
+        # aggregate native tiles into tile_target logical chunks 
+        tile = tile_target if tile_target is not None else self._tile_target
+        chunks = tuple(
+            tile if d in (dimensions.DimensionNames.SpatialY,
+                          dimensions.DimensionNames.SpatialX)
+            else 1
+            for d in selected_scene_dims
+        )
+        return da.from_zarr(store, chunks=chunks)
 
     def _read_delayed(self) -> xr.DataArray:
         """
@@ -1029,7 +1076,7 @@ class Reader(reader.Reader):
             channel_names_ref: typing.Optional[typing.List[str]] = None
             for level_idx in range(n_levels):
                 if lazy:
-                    data = self._create_dask_array_for_level(
+                    data = self._create_tiled_dask_array_for_level(
                         tiff, dims, series_idx, level_idx
                     )
                 else:
@@ -1116,7 +1163,7 @@ class Reader(reader.Reader):
         for level_idx in range(n_levels):
             level_series = series.levels[level_idx]
             if lazy:
-                data = self._create_dask_array_for_level(
+                data = self._create_tiled_dask_array_for_level(
                     tiff, dims, tiff_series_idx, level_idx
                 )
             else:
