@@ -29,24 +29,43 @@ from .qptiff_metadata import (
     ChannelInfo,
     QptiffMetadata,
     ScanResolutionInfo,
-    ome_metadata_from_qptiff,
-    ome_to_channel_coords,
-    ome_to_flat_attrs,
 )
-from .qptiff_zarr import write_ome_zarr
 from .reader import Reader
 from .reader_metadata import ReaderMetadata
+
+#: Names served lazily from the OME transport layer. Importing
+#: ``bioio_tifffile.ome`` pulls in ome_types (200+ modules), so the parse and
+#: xarray paths must not pay for it just by importing the package. Touching any
+#: of these names loads the layer on demand.
+_OME_LAZY = {
+    "ome_metadata_from_qptiff": "model",
+    "qptiff_to_ome_zarr": "convert",
+    "write_ome_zarr": "zarr_writer",
+}
+
+
+def __getattr__(name: str) -> object:
+    """PEP 562 lazy access to the OME transport layer."""
+    module = _OME_LAZY.get(name)
+    if module is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    from importlib import import_module
+
+    return getattr(import_module(f".ome.{module}", __name__), name)
+
+
+def __dir__() -> list:
+    return sorted(set(globals()) | set(_OME_LAZY))
 
 __all__ = [
     "Reader",
     "ReaderMetadata",
+    "qptiff_to_ome_zarr",
     "write_ome_zarr",
     "QptiffMetadata",
     "ChannelInfo",
     "ScanResolutionInfo",
     "ome_metadata_from_qptiff",
-    "ome_to_channel_coords",
-    "ome_to_flat_attrs",
     "build_datatree_from_levels",
     "compute_scale_attrs",
     "squeeze_to_cyx",

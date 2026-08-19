@@ -19,7 +19,7 @@ import multiscale_spatial_image  # registers the .msi accessor on xr.DataTree
 import numpy as np
 import xarray as xr
 
-from .qptiff_types import ChannelInfo
+from .qptiff_types import ChannelInfo, QptiffMetadata
 
 _UPPER_TO_LOWER = {"C": "c", "S": "c", "Y": "y", "X": "x", "Z": "z", "T": "t"}
 
@@ -61,6 +61,54 @@ def channel_infos_to_coords(
         coords[field] = xr.Variable(channel_dim, values)
 
     return coords
+
+
+def _drop_none(obj: typing.Any) -> typing.Any:
+    """Recursively remove None values from dicts/lists (for clean attrs)."""
+    if isinstance(obj, dict):
+        return {k: _drop_none(v) for k, v in obj.items() if v is not None}
+    if isinstance(obj, list):
+        return [_drop_none(v) for v in obj]
+    return obj
+
+
+def qptiff_meta_to_root_attrs(meta: "QptiffMetadata") -> typing.Dict[str, typing.Any]:
+    """
+    Build structured nested attrs for the DataTree root from a QptiffMetadata.
+
+    Returns a dict with two top-level keys:
+
+    ``"slide_info"``
+        SlideInfo fields — instrument type, operator, study name, acquisition
+        software, datetime, barcode, slide ID.
+
+    ``"image_info"``
+        ImageInfo fields for the FullResolution scene — scan mode, objective,
+        pixel size, stage position, camera and scan resolution info.
+
+    Per-channel metadata lives on the ``c`` xarray coordinates (see
+    :func:`channel_infos_to_coords` above), not in root attrs. None-valued
+    fields are omitted. The result is JSON-serializable.
+
+    Lives here rather than in ``bioio_tifffile.ome`` because it serialises the
+    dataclasses straight to xarray attrs — no OME object is involved, and the
+    xarray path must not depend on the OME transport layer.
+    """
+    from dataclasses import asdict
+
+    result: typing.Dict[str, typing.Any] = {}
+
+    slide_dict = _drop_none(asdict(meta.slide))
+    if slide_dict:
+        result["slide_info"] = slide_dict
+
+    fr = meta.full_resolution or (meta.images[0] if meta.images else None)
+    if fr is not None:
+        image_dict = _drop_none(asdict(fr.image_info))
+        if image_dict:
+            result["image_info"] = image_dict
+
+    return result
 
 
 def squeeze_to_cyx(arr: xr.DataArray) -> xr.DataArray:

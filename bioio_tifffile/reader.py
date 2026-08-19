@@ -9,25 +9,29 @@ import xml.etree.ElementTree as ET
 
 import dask.array as da
 import numpy as np
-import ome_types
 import tifffile
 import xarray as xr
+
+if typing.TYPE_CHECKING:  # the OME transport layer is imported lazily
+    import ome_types
 from bioio_base import constants, dimensions, exceptions, io, reader, types
 from dask import delayed
 from fsspec.spec import AbstractFileSystem
 from tifffile import TiffFile, imread
 from tifffile.tifffile import TiffTags
 
-from .multiscale import build_datatree_from_levels, channel_infos_to_coords, squeeze_to_cyx
-from .qptiff_zarr import write_ome_zarr as _write_ome_zarr
+from .multiscale import (
+    build_datatree_from_levels,
+    channel_infos_to_coords,
+    qptiff_meta_to_root_attrs,
+    squeeze_to_cyx,
+)
 from .qptiff_metadata import (
     ChannelInfo,
     QptiffMetadata,
     SlideInfo,
     extract_datetime_from_page,
-    ome_metadata_from_qptiff,
     parse_qpi_xml,
-    qptiff_meta_to_root_attrs,
     valid_qpi_series,
 )
 from .utils import generate_ome_channel_id, generate_ome_image_id
@@ -943,6 +947,8 @@ class Reader(reader.Reader):
                 shape = level_series.shape
 
         shape_map = dict(zip(axes.upper(), shape))
+        from .ome.model import ome_metadata_from_qptiff
+
         ome = ome_metadata_from_qptiff(
             qpi=qpi,
             scene_name=self.scenes[self.current_scene_index],
@@ -1286,7 +1292,7 @@ class Reader(reader.Reader):
         """
         Write the current scene's multiscale pyramid to an OME-NGFF v0.5 zarr store.
 
-        Convenience wrapper around :func:`~bioio_tifffile.qptiff_zarr.write_ome_zarr`.
+        Convenience wrapper around :func:`~bioio_tifffile.ome.write_ome_zarr`.
 
         Parameters
         ----------
@@ -1300,7 +1306,7 @@ class Reader(reader.Reader):
         validate:
             Validate the written store against OME-NGFF v0.5 spec. Default: True.
         **kwargs:
-            Forwarded to :func:`~bioio_tifffile.qptiff_zarr.write_ome_zarr`
+            Forwarded to :func:`~bioio_tifffile.ome.write_ome_zarr`
             (e.g. ``chunk_shape``, ``shard_shape``, ``compressor``,
             ``zarr_format``).
 
@@ -1309,6 +1315,8 @@ class Reader(reader.Reader):
         zarr.Group
             Root group of the written store.
         """
+        from .ome import write_ome_zarr as _write_ome_zarr
+
         return _write_ome_zarr(
             self.xarray_dask_datatree_data,
             self.ome_metadata,

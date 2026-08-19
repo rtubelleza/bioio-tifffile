@@ -233,8 +233,21 @@ class ChannelInfo(JsonReprMixin):
     fluorophore: Optional[str] = None
     # ExposureTime in the PerkinElmer spec is in microseconds
     exposure_time_us: Optional[float] = None
+    #: Midpoint of the active band — the single value OME's
+    #: Channel.emission_wavelength / .excitation_wavelength take. Derived from
+    #: the cut-on/cut-off edges below when a <Band> is present.
     emission_wavelength_nm: Optional[float] = None
     excitation_wavelength_nm: Optional[float] = None
+    #: Raw passband edges of the *active* band, feeding OME's
+    #: Filter.transmittance_range (cut_in / cut_out). Averaging these into the
+    #: midpoint alone loses the passband width.
+    emission_cut_on_nm: Optional[float] = None
+    emission_cut_off_nm: Optional[float] = None
+    excitation_cut_on_nm: Optional[float] = None
+    excitation_cut_off_nm: Optional[float] = None
+    #: Number of bands the filter cube declares; >1 means a multi-pass cube
+    #: (OME Filter.type MULTI_PASS rather than BAND_PASS).
+    n_filter_bands: Optional[int] = None
     is_brightfield: bool = False
     # Per spec: <Color>r,g,b</Color> — display colour for this band
     color_rgb: Optional[Tuple[int, int, int]] = None

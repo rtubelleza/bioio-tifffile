@@ -94,12 +94,6 @@ _DIALECTS: Dict[str, _DialectTags] = {
     ),
 }
 
-#: Which dialect each channel-metadata locus speaks.
-_LOCUS_DIALECT: Dict[str, str] = {
-    LOCUS_SHARED_SCANBANDS: DIALECT_SCANBAND,
-    LOCUS_PER_PAGE_ROOT: DIALECT_PAGED,
-}
-
 
 def _text(element: Optional[ET.Element]) -> Optional[str]:
     """Return stripped text of an Element, or None."""
@@ -342,28 +336,49 @@ def _determine_locus(sig: _StructureSignals) -> str:
     return LOCUS_UNKNOWN
 
 
-def _select_active_band(
-    filter_elem: Optional[ET.Element],
-) -> Optional[ET.Element]:
-    """Return the <Band> flagged <Active>true</Active>, else the first band.
-
-    Fusion 1.x per-page XMLs list every band of the multi-band filter; only one
-    is marked active for that channel. Older formats omit <Active> entirely, so
-    we fall back to the first band to preserve prior behaviour.
-    """
+def _active_band_index(filter_elem: Optional[ET.Element]) -> Optional[int]:
+    """Position of the <Band> flagged <Active>true</Active>, or None."""
     if filter_elem is None:
         return None
-    bands = filter_elem.findall("Bands/Band")
-    if not bands:
-        return None
-    for b in bands:
+    for i, b in enumerate(filter_elem.findall("Bands/Band")):
         active = b.find("Active")
         if active is not None and active.text and active.text.strip().lower() in (
             "true",
             "1",
             "yes",
         ):
-            return b
+            return i
+    return None
+
+
+def _select_band(
+    filter_elem: Optional[ET.Element],
+    active_idx: Optional[int] = None,
+) -> Optional[ET.Element]:
+    """Return the band this channel actually used.
+
+    Fusion per-page XMLs list every band of the multi-band cube; only one
+    applies to the channel. Crucially, **only the excitation filter flags it** —
+    the emission filter lists the same cube's bands in the same order with no
+    <Active> element at all. So the active position has to carry across from
+    whichever filter declares it. Taking each filter's own first band instead
+    silently assigns every non-first channel the wrong emission passband (a
+    75-plex ATTO 550 channel would report DAPI's 440-466 nm).
+
+    ``active_idx`` is that carried-over position. Falls back to the first band
+    when nothing anywhere declares one, preserving behaviour for older formats
+    that omit <Active> entirely.
+    """
+    if filter_elem is None:
+        return None
+    bands = filter_elem.findall("Bands/Band")
+    if not bands:
+        return None
+    own = _active_band_index(filter_elem)
+    if own is not None:
+        return bands[own]
+    if active_idx is not None and 0 <= active_idx < len(bands):
+        return bands[active_idx]
     return bands[0]
 
 
@@ -409,22 +424,47 @@ def _populate_channel_fields_from_element(
         except ValueError:
             pass
 
-    # emission / excitation wavelengths. Filters may list multiple bands (one
-    # per channel); prefer the one flagged <Active>true</Active>, else the
-    # first band.
-    em_band = _select_active_band(elem.find(".//EmissionFilter"))
-    if em_band is not None:
-        cuton = _float(em_band.find("Cuton"))
-        cutoff = _float(em_band.find("Cutoff"))
-        if cuton is not None and cutoff is not None:
-            fields["emission_wavelength_nm"] = (cuton + cutoff) / 2.0
+    # emission / excitation bands. Filters may list every band of a multi-band
+    # cube (one per channel); prefer the one flagged <Active>true</Active>, else
+    # the first band.
+    #
+    # Keep the raw cut-on/cut-off edges as well as the midpoint: OME's
+    # Filter.transmittance_range wants the edges, and averaging them away loses
+    # the passband width. The midpoint stays as the derived single wavelength
+    # that Channel.emission_wavelength/excitation_wavelength need.
+    em_filter = elem.find(".//EmissionFilter")
+    ex_filter = elem.find(".//ExcitationFilter")
+    # Only the excitation filter flags its active band; the emission filter
+    # lists the same cube's bands in the same order without <Active>, so the
+    # position carries across. See _select_band.
+    active_idx = _active_band_index(ex_filter)
+    if active_idx is None:
+        active_idx = _active_band_index(em_filter)
 
-    ex_band = _select_active_band(elem.find(".//ExcitationFilter"))
-    if ex_band is not None:
-        cuton = _float(ex_band.find("Cuton"))
-        cutoff = _float(ex_band.find("Cutoff"))
-        if cuton is not None and cutoff is not None:
-            fields["excitation_wavelength_nm"] = (cuton + cutoff) / 2.0
+    for prefix, filter_elem in (
+        ("emission", em_filter),
+        ("excitation", ex_filter),
+    ):
+        band = _select_band(filter_elem, active_idx)
+        if band is None:
+            continue
+        cuton = _float(band.find("Cuton"))
+        cutoff = _float(band.find("Cutoff"))
+        if cuton is None or cutoff is None:
+            continue
+        fields[f"{prefix}_cut_on_nm"] = cuton
+        fields[f"{prefix}_cut_off_nm"] = cutoff
+        fields[f"{prefix}_wavelength_nm"] = (cuton + cutoff) / 2.0
+
+    # How many bands the cube declares, so OME can distinguish a plain
+    # band-pass filter from a multi-pass one. Both filters describe the same
+    # physical cube, so either is a valid source.
+    for filter_elem in (em_filter, ex_filter):
+        if filter_elem is not None:
+            n_bands = len(filter_elem.findall("Bands/Band"))
+            if n_bands:
+                fields["n_filter_bands"] = n_bands
+                break
 
     # fallback to a <HomeWavelength> element for old ScanBands format
     if "emission_wavelength_nm" not in fields:

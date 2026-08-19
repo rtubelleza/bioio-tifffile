@@ -24,10 +24,9 @@ from bioio_tifffile.qptiff_metadata import (
     LOCUS_RGB_SAMPLES,
     LOCUS_SHARED_SCANBANDS,
     LOCUS_UNKNOWN,
-    ome_metadata_from_qptiff,
-    ome_to_flat_attrs,
     parse_qpi_xml,
 )
+from bioio_tifffile.qptiff_types import QptiffMetadata
 
 from .conftest import LOCAL_RESOURCES_DIR
 
@@ -437,7 +436,7 @@ class TestSharedScanbandDialect:
     never leak across and start reading <Name> as a fluorophore here.
     """
 
-    def _meta(self, n_pages: int = 3) -> object:
+    def _meta(self, n_pages: int = 3) -> "QptiffMetadata":
         # every page repeats the one shared XML, as these files really do
         pages = [SHARED_SCANBAND_XML] * n_pages
         return parse_qpi_xml(
@@ -508,6 +507,81 @@ class TestSharedScanbandDialect:
         assert meta.acquisition_software == "Vectra 3.0.3"
         assert meta.description_version == "2"
         assert meta.pixel_size_um == pytest.approx(0.496)
+
+
+def _multiband_page_xml(biomarker: str, filter_name: str, active: int) -> str:
+    """A page from a 3-band cube where only the EXCITATION filter flags which
+    band is active — exactly how Fusion writes it. The emission filter lists the
+    same cube's bands in the same order with no <Active> at all."""
+    ex_bands = "".join(
+        f"<Band><Cuton>{on}</Cuton><Cutoff>{off}</Cutoff>"
+        f"<Active>{'true' if i == active else 'false'}</Active></Band>"
+        for i, (on, off) in enumerate([(377.0, 405.0), (533.0, 559.0), (715.0, 755.0)])
+    )
+    em_bands = "".join(
+        f"<Band><Cuton>{on}</Cuton><Cutoff>{off}</Cutoff></Band>"
+        for on, off in [(440.0, 466.0), (570.0, 640.0), (767.0, 900.0)]
+    )
+    return f"""\
+<?xml version="1.0" encoding="utf-16"?>
+<PerkinElmer-QPI-ImageDescription>
+  <ImageType>FullResolution</ImageType>
+  <Name>{filter_name}</Name>
+  <Biomarker>{biomarker}</Biomarker>
+  <ExcitationFilter><Name>Multi</Name><Bands>{ex_bands}</Bands></ExcitationFilter>
+  <EmissionFilter><Name>Multi</Name><Bands>{em_bands}</Bands></EmissionFilter>
+</PerkinElmer-QPI-ImageDescription>
+"""
+
+
+class TestFilterBandSelection:
+    """The active band position carries from the excitation filter to the
+    emission filter, which never flags one itself."""
+
+    def test_emission_band_follows_active_excitation_index(self) -> None:
+        pages = [
+            _multiband_page_xml("DAPI", "DAPI", 0),
+            _multiband_page_xml("CI.PARP-Atto550", "ATTO 550", 1),
+            _multiband_page_xml("G6PD-AF750", "AF 750", 2),
+        ]
+        meta = parse_qpi_xml(pages[0], n_channels=3, per_page_xmls=pages)
+        # each channel must get ITS band, not the emission filter's first one
+        assert [
+            (c.emission_cut_on_nm, c.emission_cut_off_nm) for c in meta.channels
+        ] == [(440.0, 466.0), (570.0, 640.0), (767.0, 900.0)]
+        assert [c.emission_wavelength_nm for c in meta.channels] == [
+            pytest.approx(453.0),
+            pytest.approx(605.0),
+            pytest.approx(833.5),
+        ]
+
+    def test_excitation_band_uses_its_own_active_flag(self) -> None:
+        meta = parse_qpi_xml(
+            _multiband_page_xml("CI.PARP-Atto550", "ATTO 550", 1),
+            n_channels=1,
+            per_page_xmls=[_multiband_page_xml("CI.PARP-Atto550", "ATTO 550", 1)],
+        )
+        ch = meta.channels[0]
+        assert (ch.excitation_cut_on_nm, ch.excitation_cut_off_nm) == (533.0, 559.0)
+        assert ch.excitation_wavelength_nm == pytest.approx(546.0)
+
+    def test_band_count_recorded(self) -> None:
+        meta = parse_qpi_xml(
+            _multiband_page_xml("DAPI", "DAPI", 0),
+            n_channels=1,
+            per_page_xmls=[_multiband_page_xml("DAPI", "DAPI", 0)],
+        )
+        assert meta.channels[0].n_filter_bands == 3
+
+    def test_falls_back_to_first_band_when_nothing_is_flagged(self) -> None:
+        """Older formats omit <Active> entirely — behaviour must not change."""
+        xml = _multiband_page_xml("CD3", "OPAL570", 0).replace(
+            "<Active>true</Active>", "<Active>false</Active>"
+        )
+        meta = parse_qpi_xml(xml, n_channels=1, per_page_xmls=[xml])
+        ch = meta.channels[0]
+        assert (ch.emission_cut_on_nm, ch.emission_cut_off_nm) == (440.0, 466.0)
+        assert (ch.excitation_cut_on_nm, ch.excitation_cut_off_nm) == (377.0, 405.0)
 
 
 class TestFusionPagedFluorophore:
@@ -609,14 +683,6 @@ class TestParseQpiXml:
         assert meta.channel_names == ["Red", "Green", "Blue"]
         for ch in meta.channels:
             assert ch.is_brightfield is True
-
-    def test_brightfield_to_dict_keys(self) -> None:
-        meta = parse_qpi_xml(BRIGHTFIELD_XML, n_channels=3)
-        d = ome_to_flat_attrs(ome_metadata_from_qptiff(meta))
-        assert d["qpi_slide_id"] == "TestSlide_001"
-        assert d["Pixels:PhysicalSizeX"] == pytest.approx(0.25)
-        assert d["Channel:0:Name"] == "Red"
-        assert d["qpi_is_brightfield"] == "True"
 
     def test_fluorescence_channels(self) -> None:
         meta = parse_qpi_xml(FLUORESCENCE_XML)
