@@ -57,20 +57,61 @@ class JsonReprMixin:
             self.to_dict(include_raw_xml=include_raw_xml), default=str, **kwargs
         )
 
-#: H&E / IHC brightfield scan. scan_mode contains "Brightfield" or BFLampType
-#: is present. Channels are RGB samples stored in the S dimension.
+# ---------------------------------------------------------------------------
+# Legacy acquisition-format labels (DEPRECATED as a dispatch key).
+#
+# These names describe the vendor product we *guessed* wrote the file, and they
+# have turned out not to predict how it must be parsed. Empirically the channel
+# dialect is identical across Fusion 1.0.6, 1.0.8 and 2.3.1 (DescriptionVersion
+# 4 and 6 alike), while optional field presence varies at patch level — so
+# vendor/version granularity is wrong in both directions. Worse, files that land
+# on ``polaris_scanband`` because a filter-cube <ScanBands-i> block exists must
+# still be parsed page-by-page.
+#
+# Parsing now dispatches on LOCUS_* below. These constants are retained solely
+# so ``QptiffMetadata.acquisition_format`` keeps emitting the exact strings that
+# already reached written zarr stores; do not branch on them in new code.
+# ---------------------------------------------------------------------------
+
+#: RGB brightfield scan (H&E / IHC): samples stored in the S dimension.
 FORMAT_BRIGHTFIELD = "brightfield"
 
-#: Older Vectra / Polaris / OPAL format. Channel metadata lives in
-#: <ScanBands-i> elements inside an XML <ScanProfile>.
+#: A <ScanBands-i> block is present anywhere in the tree. NOTE: this says only
+#: that a filter-cube description exists, NOT that channels are described there
+#: — newer paged files carry both. See :data:`LOCUS_SHARED_SCANBANDS`.
 FORMAT_POLARIS_SCANBAND = "polaris_scanband"
 
-#: Newer Akoya Biosciences / Fusion 1.x format. ScanProfile is a JSON blob;
-#: each TIFF page carries its own <Biomarker> / <ExposureTime> in tag 270.
+#: <ScanProfile> content is a JSON blob (Fusion 1.x and 2.x alike).
 FORMAT_FUSION_PAGED = "fusion_paged"
 
 #: No recognised structural signals. Parser will try strategies in order.
 FORMAT_UNKNOWN = "unknown"
+
+
+# ---------------------------------------------------------------------------
+# Channel-metadata locus — where per-channel fields actually live.
+#
+# This is the axis that predicts parsing behaviour, and the one the parser
+# dispatches on. The field dialect (what a given tag *means*) is a function of
+# the locus, not of the acquisition software version.
+# ---------------------------------------------------------------------------
+
+#: Channels are the RGB samples of a single acquisition, stored in the S
+#: dimension. There is no per-channel biomarker/filter metadata to find.
+LOCUS_RGB_SAMPLES = "rgb_samples"
+
+#: Per-channel metadata lives in <ScanBands-i> elements of one shared XML that
+#: every page repeats (classic Vectra / Polaris / OPAL). In this dialect
+#: <Fluorophore> is explicit and <Name> means the biomarker.
+LOCUS_SHARED_SCANBANDS = "shared_scanbands"
+
+#: Each page's own XML root carries its channel's metadata (Fusion 1.x and 2.x,
+#: and "paged Polaris"). In this dialect there is no <Fluorophore> element at
+#: all: <Biomarker> is the stain and <Name> is the fluorophore/filter.
+LOCUS_PER_PAGE_ROOT = "per_page_root"
+
+#: No recognised locus; the parser falls back to trying strategies in order.
+LOCUS_UNKNOWN = "unknown"
 
 
 @dataclass
@@ -295,7 +336,16 @@ class QptiffMetadata(JsonReprMixin):
 
     slide: SlideInfo = field(default_factory=SlideInfo)
     images: List[QptiffImageSceneMetadata] = field(default_factory=list)
-    acquisition_format: Optional[str] = None  # one of the FORMAT_* constants; defines how we parse in xmls
+    #: DEPRECATED as a dispatch key — one of the FORMAT_* constants. Retained
+    #: verbatim for back-compat with zarr stores already written; parsing is
+    #: driven by :attr:`channel_locus`.
+    acquisition_format: Optional[str] = None
+    #: One of the LOCUS_* constants: where per-channel metadata actually lives.
+    #: This is what the parser dispatches on.
+    channel_locus: Optional[str] = None
+    #: Primitive structural signals the locus was derived from. Recorded so the
+    #: real-world corpus can be measured without re-opening files.
+    structure_signature: Dict[str, object] = field(default_factory=dict)
     raw_xml: str = ""
 
     @property

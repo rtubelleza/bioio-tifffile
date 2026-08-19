@@ -112,3 +112,6 @@ ENV/
 
 # uv
 uv.lock
+
+# sandboxing
+scripts/

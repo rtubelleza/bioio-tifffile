@@ -6,6 +6,7 @@ Include qptiff file cases.
 """
 
 import pathlib
+import re
 import time
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -16,6 +17,13 @@ from distributed import Client, LocalCluster
 
 from bioio_tifffile import Reader
 from bioio_tifffile.qptiff_metadata import (
+    FORMAT_BRIGHTFIELD,
+    FORMAT_FUSION_PAGED,
+    FORMAT_POLARIS_SCANBAND,
+    LOCUS_PER_PAGE_ROOT,
+    LOCUS_RGB_SAMPLES,
+    LOCUS_SHARED_SCANBANDS,
+    LOCUS_UNKNOWN,
     ome_metadata_from_qptiff,
     ome_to_flat_attrs,
     parse_qpi_xml,
@@ -189,6 +197,371 @@ FLUORESCENCE_XML = """\
   </ScanProfile>
 </PerkinElmer-QPI-ImageDescription>
 """
+
+
+def _fusion_page_xml(biomarker: str, filter_name: str) -> str:
+    """Build one Fusion 2.x per-page ImageDescription.
+
+    ``<Name>`` is the filter / fluorophore and ``<Biomarker>`` the stain;
+    neither ``<Fluorophore>`` nor ``<Fluor>`` is ever emitted by these files.
+    """
+    return f"""\
+<?xml version="1.0" encoding="utf-16"?>
+<PerkinElmer-QPI-ImageDescription>
+  <ImageType>FullResolution</ImageType>
+  <SlideID>TestSlide_003</SlideID>
+  <Name>{filter_name}</Name>
+  <Biomarker>{biomarker}</Biomarker>
+  <Responsivity>
+    <Filter>
+      <Name>{filter_name}</Name>
+      <Response>244.87</Response>
+    </Filter>
+  </Responsivity>
+  <ScanProfile>{{"binning":2,"experimentDescription":{{"channels":[
+    {{"name":"DAPI"}},{{"name":"ATTO550"}},{{"name":"CY5"}},{{"name":"AF750"}}]}}}}</ScanProfile>
+</PerkinElmer-QPI-ImageDescription>
+"""
+
+
+# Acquisition order is NOT a repeating cycle of the four-filter set: index 2 is
+# AF 750, not CY5. This is what makes an ``index % n_filters`` mapping unsafe.
+_FUSION_FILTERS = ["DAPI", "ATTO 550", "AF 750", "Cy5", "ATTO 550"]
+_FUSION_BIOMARKERS = [
+    "DAPI",
+    "CD38-Atto550",
+    "CD107a-AF750",
+    "CD4-AF647",
+    "CI.PARP-Atto550",
+]
+FUSION_PAGED_XMLS = [
+    _fusion_page_xml(bm, filt) for bm, filt in zip(_FUSION_BIOMARKERS, _FUSION_FILTERS)
+]
+
+
+def _strip_fluorophore_sources(xml: str, filter_name: str) -> str:
+    """Remove both fluorophore sources (<Name> and the Responsivity echo)."""
+    xml = xml.replace(f"<Name>{filter_name}</Name>", "<Name />", 1)
+    return re.sub(r"<Responsivity>.*?</Responsivity>", "", xml, flags=re.S)
+
+
+def _paged_polaris_xml(biomarker: str, filter_name: str, mode: str) -> str:
+    """A page from a "paged Polaris" file.
+
+    These carry per-channel metadata at the page root *and* a filter-cube
+    <ScanBands-i> block in a shared XML ScanProfile, so both candidate sources
+    are present at once.
+    """
+    return f"""\
+<?xml version="1.0" encoding="utf-16"?>
+<PerkinElmer-QPI-ImageDescription>
+  <ImageType>FullResolution</ImageType>
+  <SlideID>TestSlide_004</SlideID>
+  <Name>{filter_name}</Name>
+  <Biomarker>{biomarker}</Biomarker>
+  <ScanProfile><root>
+    <Mode>{mode}</Mode>
+    <ScanBands>
+      <ScanBands-i><Name>Cube_A</Name></ScanBands-i>
+      <ScanBands-i><Name>Cube_B</Name></ScanBands-i>
+      <ScanBands-i><Name>Cube_C</Name></ScanBands-i>
+    </ScanBands>
+  </root></ScanProfile>
+</PerkinElmer-QPI-ImageDescription>
+"""
+
+
+class TestChannelLocus:
+    """Dispatch keys off where channel metadata lives, not the vendor version."""
+
+    def test_legacy_acquisition_format_unchanged(self) -> None:
+        """Back-compat guard: these strings already reached written zarr stores
+        and must keep their exact historical values."""
+        assert (
+            parse_qpi_xml(BRIGHTFIELD_XML, n_channels=3).acquisition_format
+            == FORMAT_BRIGHTFIELD
+        )
+        assert (
+            parse_qpi_xml(FLUORESCENCE_XML).acquisition_format
+            == FORMAT_POLARIS_SCANBAND
+        )
+        assert (
+            parse_qpi_xml(
+                FUSION_PAGED_XMLS[0],
+                n_channels=len(FUSION_PAGED_XMLS),
+                per_page_xmls=FUSION_PAGED_XMLS,
+            ).acquisition_format
+            == FORMAT_FUSION_PAGED
+        )
+
+    def test_locus_of_each_fixture(self) -> None:
+        assert (
+            parse_qpi_xml(BRIGHTFIELD_XML, n_channels=3).channel_locus
+            == LOCUS_RGB_SAMPLES
+        )
+        assert parse_qpi_xml(FLUORESCENCE_XML).channel_locus == LOCUS_SHARED_SCANBANDS
+        assert (
+            parse_qpi_xml(
+                FUSION_PAGED_XMLS[0],
+                n_channels=len(FUSION_PAGED_XMLS),
+                per_page_xmls=FUSION_PAGED_XMLS,
+            ).channel_locus
+            == LOCUS_PER_PAGE_ROOT
+        )
+
+    def test_paged_polaris_splits_legacy_label_from_locus(self) -> None:
+        """ScanBands-i present, but the stains are at the page roots: the legacy
+        label stays polaris_scanband while the locus tells the truth."""
+        pages = [
+            _paged_polaris_xml(bm, f, "im_Fluorescence")
+            for bm, f in [("CD3-Opal570", "OPAL 570"), ("CD8-Opal690", "OPAL 690")]
+        ]
+        meta = parse_qpi_xml(pages[0], n_channels=2, per_page_xmls=pages)
+        assert meta.acquisition_format == FORMAT_POLARIS_SCANBAND
+        assert meta.channel_locus == LOCUS_PER_PAGE_ROOT
+        assert meta.channel_names == ["CD3-Opal570", "CD8-Opal690"]
+        assert [ch.fluorophore for ch in meta.channels] == ["OPAL 570", "OPAL 690"]
+
+    def test_identical_page_xmls_still_read_as_paged(self) -> None:
+        """The old discriminator asked whether page XML strings differed, which
+        said nothing when a scan's pages were legitimately identical. Position of
+        the tag — root child vs nested in ScanBands-i — is the real signal."""
+        page = _fusion_page_xml("CD3-Atto550", "ATTO 550")
+        pages = [page, page]
+        meta = parse_qpi_xml(page, n_channels=2, per_page_xmls=pages)
+        assert meta.channel_locus == LOCUS_PER_PAGE_ROOT
+        assert meta.channel_names == ["CD3-Atto550", "CD3-Atto550"]
+        assert [ch.fluorophore for ch in meta.channels] == ["ATTO 550"] * 2
+
+    def test_shared_scanband_dialect_keeps_name_as_biomarker(self) -> None:
+        """In the scanband dialect <Name> means the stain, not the fluorophore —
+        the opposite of the paged dialect. Guards against the fix for one
+        leaking into the other."""
+        xml = """\
+        <PerkinElmer-QPI-ImageDescription>
+          <ScanProfile><root><Mode>im_Fluorescence</Mode>
+            <ScanBands>
+              <ScanBands-i><Name>CD20</Name></ScanBands-i>
+            </ScanBands>
+          </root></ScanProfile>
+        </PerkinElmer-QPI-ImageDescription>"""
+        meta = parse_qpi_xml(xml)
+        assert meta.channel_locus == LOCUS_SHARED_SCANBANDS
+        assert meta.channel_names == ["CD20"]
+        assert meta.channels[0].fluorophore is None
+
+    def test_structure_signature_recorded(self) -> None:
+        meta = parse_qpi_xml(
+            FUSION_PAGED_XMLS[0],
+            n_channels=len(FUSION_PAGED_XMLS),
+            per_page_xmls=FUSION_PAGED_XMLS,
+        )
+        sig = meta.structure_signature
+        assert sig["has_json_scanprofile"] is True
+        assert sig["has_scanbands"] is False
+        assert sig["pages_with_root_channel_tags"] == 5
+        assert sig["n_pages"] == 5
+
+    def test_unknown_structure_fails_open(self) -> None:
+        """An unrecognised file must degrade, never raise."""
+        xml = "<PerkinElmer-QPI-ImageDescription><ImageType>FullResolution</ImageType></PerkinElmer-QPI-ImageDescription>"  # noqa: E501
+        meta = parse_qpi_xml(xml, n_channels=2)
+        assert meta.channel_locus == LOCUS_UNKNOWN
+        assert meta.channel_names == ["Channel_0", "Channel_1"]
+
+
+# A classic Vectra/Polaris OPAL scan: ONE shared XML that every page repeats,
+# with the per-channel metadata inside <ScanBands-i>. Note <Name> here is the
+# biomarker and <Fluorophore> is explicit — the exact inverse of the paged
+# dialect above, which is what makes this the cross-dialect regression guard.
+SHARED_SCANBAND_XML = """\
+<?xml version="1.0" encoding="utf-16"?>
+<PerkinElmer-QPI-ImageDescription>
+  <DescriptionVersion>2</DescriptionVersion>
+  <AcquisitionSoftware>Vectra 3.0.3</AcquisitionSoftware>
+  <ImageType>FullResolution</ImageType>
+  <SlideID>TestSlide_OPAL</SlideID>
+  <ExposureTimeArray>
+    <Value>1000</Value>
+    <Value>2000</Value>
+    <Value>3000</Value>
+  </ExposureTimeArray>
+  <ScanProfile><root>
+    <Mode>im_Fluorescence</Mode>
+    <Name>OPAL 3-plex</Name>
+    <OpalKitType>Opal7</OpalKitType>
+    <ScanResolution>
+      <PixelSizeMicrons>0.496</PixelSizeMicrons>
+      <Magnification>20</Magnification>
+      <ObjectiveName>20x</ObjectiveName>
+    </ScanResolution>
+    <ScanBands>
+      <ScanBands-i>
+        <Name>CD3</Name>
+        <Fluorophore>OPAL570</Fluorophore>
+        <HomeWavelength>570</HomeWavelength>
+        <ExcitationWavelength>550</ExcitationWavelength>
+        <Color>255,0,0</Color>
+        <Gain>1.5</Gain>
+        <Binning>2</Binning>
+        <AutoExposeType>aet_Fluorescence</AutoExposeType>
+      </ScanBands-i>
+      <ScanBands-i>
+        <Biomarker>CD8</Biomarker>
+        <Name>ShouldNotBeTheFluorophore</Name>
+        <Fluorophore>OPAL690</Fluorophore>
+        <HomeWavelength>690</HomeWavelength>
+        <Color>0,255,0</Color>
+        <Gain>2.0</Gain>
+        <Binning>2</Binning>
+      </ScanBands-i>
+      <ScanBands-i>
+        <Name>DAPI</Name>
+        <Fluorophore>DAPI</Fluorophore>
+        <HomeWavelength>460</HomeWavelength>
+        <Color>0,0,255</Color>
+        <Gain>1.0</Gain>
+        <Binning>2</Binning>
+      </ScanBands-i>
+    </ScanBands>
+  </root></ScanProfile>
+</PerkinElmer-QPI-ImageDescription>
+"""
+
+
+class TestSharedScanbandDialect:
+    """Classic Vectra/Polaris OPAL: channel metadata lives in <ScanBands-i>.
+
+    In this dialect <Fluorophore> is explicit, so <Name> means the biomarker —
+    the opposite of the paged dialect. These tests exist so the paged fix can
+    never leak across and start reading <Name> as a fluorophore here.
+    """
+
+    def _meta(self, n_pages: int = 3) -> object:
+        # every page repeats the one shared XML, as these files really do
+        pages = [SHARED_SCANBAND_XML] * n_pages
+        return parse_qpi_xml(
+            SHARED_SCANBAND_XML, n_channels=n_pages, per_page_xmls=pages
+        )
+
+    def test_locus_and_legacy_label(self) -> None:
+        """Identical page XMLs carrying no root-level channel tags must resolve
+        to the shared-scanbands locus, not the paged one."""
+        meta = self._meta()
+        assert meta.channel_locus == LOCUS_SHARED_SCANBANDS
+        assert meta.acquisition_format == FORMAT_POLARIS_SCANBAND
+
+    def test_name_is_the_biomarker_not_the_fluorophore(self) -> None:
+        meta = self._meta()
+        assert meta.channel_names == ["CD3", "CD8", "DAPI"]
+        # <Biomarker> still outranks <Name> when both are present
+        assert meta.channels[1].name == "CD8"
+
+    def test_fluorophore_comes_only_from_the_explicit_tag(self) -> None:
+        meta = self._meta()
+        assert [ch.fluorophore for ch in meta.channels] == [
+            "OPAL570",
+            "OPAL690",
+            "DAPI",
+        ]
+        # the paged rule must not leak in: <Name> is never a fluorophore here
+        assert all(
+            ch.fluorophore != "ShouldNotBeTheFluorophore" for ch in meta.channels
+        )
+
+    def test_wavelengths_from_home_wavelength(self) -> None:
+        meta = self._meta()
+        assert [ch.emission_wavelength_nm for ch in meta.channels] == [
+            pytest.approx(570.0),
+            pytest.approx(690.0),
+            pytest.approx(460.0),
+        ]
+        assert meta.channels[0].excitation_wavelength_nm == pytest.approx(550.0)
+
+    def test_exposure_times_fall_back_to_the_root_array(self) -> None:
+        """<ScanBands-i> carries no <ExposureTime>; the positional
+        <ExposureTimeArray> supplies it."""
+        meta = self._meta()
+        assert [ch.exposure_time_us for ch in meta.channels] == [
+            pytest.approx(1000.0),
+            pytest.approx(2000.0),
+            pytest.approx(3000.0),
+        ]
+
+    def test_detector_fields_read_directly_off_the_band(self) -> None:
+        """This layout has no <CameraSettings>: Gain/Binning hang off the band."""
+        meta = self._meta()
+        assert [ch.gain for ch in meta.channels] == [1.5, 2.0, 1.0]
+        assert [ch.binning for ch in meta.channels] == [2, 2, 2]
+        assert meta.channels[0].auto_expose_type == "aet_Fluorescence"
+        assert meta.channels[0].color_rgb == (255, 0, 0)
+
+    def test_opal_wavelength_inferred_when_home_wavelength_absent(self) -> None:
+        xml = SHARED_SCANBAND_XML.replace(
+            "<HomeWavelength>570</HomeWavelength>", ""
+        )
+        meta = parse_qpi_xml(xml)
+        assert meta.channels[0].emission_wavelength_nm == pytest.approx(570.0)
+
+    def test_slide_provenance_recorded(self) -> None:
+        meta = self._meta()
+        assert meta.acquisition_software == "Vectra 3.0.3"
+        assert meta.description_version == "2"
+        assert meta.pixel_size_um == pytest.approx(0.496)
+
+
+class TestFusionPagedFluorophore:
+    """Fusion 2.x paged QPTIFFs: fluorophore comes from each page's <Name>."""
+
+    def test_fluorophore_from_page_name(self) -> None:
+        meta = parse_qpi_xml(
+            FUSION_PAGED_XMLS[0],
+            n_channels=len(FUSION_PAGED_XMLS),
+            per_page_xmls=FUSION_PAGED_XMLS,
+        )
+        assert meta.acquisition_format == FORMAT_FUSION_PAGED
+        assert [ch.fluorophore for ch in meta.channels] == _FUSION_FILTERS
+
+    def test_biomarker_still_wins_for_name(self) -> None:
+        """<Name> feeds fluorophore only — the channel name stays the stain."""
+        meta = parse_qpi_xml(
+            FUSION_PAGED_XMLS[0],
+            n_channels=len(FUSION_PAGED_XMLS),
+            per_page_xmls=FUSION_PAGED_XMLS,
+        )
+        assert meta.channel_names == _FUSION_BIOMARKERS
+
+    def test_responsivity_filter_name_fallback(self) -> None:
+        """With <Name> empty, the Responsivity filter name still supplies it."""
+        pages = [
+            x.replace(f"<Name>{f}</Name>", "<Name />", 1)
+            for x, f in zip(FUSION_PAGED_XMLS, _FUSION_FILTERS)
+        ]
+        meta = parse_qpi_xml(pages[0], n_channels=len(pages), per_page_xmls=pages)
+        assert [ch.fluorophore for ch in meta.channels] == _FUSION_FILTERS
+
+    def test_no_positional_guess_when_counts_mismatch(self) -> None:
+        """5 pages against a 4-filter ScanProfile must not be cycled."""
+        pages = [
+            _strip_fluorophore_sources(x, f)
+            for x, f in zip(FUSION_PAGED_XMLS, _FUSION_FILTERS)
+        ]
+        meta = parse_qpi_xml(pages[0], n_channels=len(pages), per_page_xmls=pages)
+        assert [ch.fluorophore for ch in meta.channels] == [None] * 5
+
+    def test_positional_fallback_when_counts_match(self) -> None:
+        """A single-cycle scan (n_pages == n_filters) may map 1:1 in order."""
+        pages = [
+            _strip_fluorophore_sources(x, f)
+            for x, f in zip(FUSION_PAGED_XMLS[:4], _FUSION_FILTERS[:4])
+        ]
+        meta = parse_qpi_xml(pages[0], n_channels=4, per_page_xmls=pages)
+        assert [ch.fluorophore for ch in meta.channels] == [
+            "DAPI",
+            "ATTO550",
+            "CY5",
+            "AF750",
+        ]
 
 
 class TestParseQpiXml:

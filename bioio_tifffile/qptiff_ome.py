@@ -10,6 +10,7 @@ metadata.
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -294,6 +295,15 @@ def ome_metadata_from_qptiff(
         ("is_tma", _str(qpi.is_tma)),
         ("opal_kit_type", qpi.opal_kit_type),
         ("acquisition_format", qpi.acquisition_format),
+        ("channel_locus", qpi.channel_locus),
+        (
+            "structure_signature",
+            (
+                json.dumps(qpi.structure_signature, sort_keys=True)
+                if qpi.structure_signature
+                else None
+            ),
+        ),
         ("stored_bits_per_sample", _str(ii.stored_bits_per_sample)),
         ("scale_factor", _str(ii.scale_factor)),
         ("scale_factor_unit", ii.scale_factor_unit),

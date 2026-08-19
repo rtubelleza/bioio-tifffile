@@ -14,13 +14,17 @@ import json
 import logging
 import re
 import xml.etree.ElementTree as ET
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 from .qptiff_types import (
     FORMAT_BRIGHTFIELD,
     FORMAT_FUSION_PAGED,
     FORMAT_POLARIS_SCANBAND,
     FORMAT_UNKNOWN,
+    LOCUS_PER_PAGE_ROOT,
+    LOCUS_RGB_SAMPLES,
+    LOCUS_SHARED_SCANBANDS,
+    LOCUS_UNKNOWN,
     CameraInfo,
     ChannelInfo,
     ImageInfo,
@@ -49,6 +53,52 @@ _FLUOROPHORE_TAGS = [
     "Fluorophore",
     "Fluor",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Channel field dialects.
+#
+# A tag does not mean the same thing in every QPTIFF layout, seem to see these
+# patterns:
+#   scanband — classic Vectra/Polaris/OPAL <ScanBands-i>. <Fluorophore> is
+#              explicit, so <Name> is free to mean the biomarker.
+#   paged    — Fusion 1.x/2.x page roots. There is no <Fluorophore> element at
+#              all: <Biomarker> is the stain and <Name> is the fluorophore,
+#              echoed by <Responsivity><Filter><Name>.
+# ---------------------------------------------------------------------------
+DIALECT_SCANBAND = "scanband"
+DIALECT_PAGED = "paged"
+
+
+class _DialectTags(NamedTuple):
+    #: Tags consulted, in order, for the channel's biomarker/stain name.
+    name: Tuple[str, ...]
+    #: Consulted for the name only if none of ``name`` matched.
+    name_fallback: Tuple[str, ...]
+    #: Tags/paths consulted, in order, for the fluorophore.
+    fluorophore: Tuple[str, ...]
+
+
+_DIALECTS: Dict[str, _DialectTags] = {
+    DIALECT_SCANBAND: _DialectTags(
+        name=tuple(_BIOMARKER_TAGS),
+        name_fallback=(),
+        fluorophore=tuple(_FLUOROPHORE_TAGS),
+    ),
+    DIALECT_PAGED: _DialectTags(
+        # deliberately excludes "Name" — here it is the fluorophore
+        name=tuple(t for t in _BIOMARKER_TAGS if t != "Name"),
+        # ...but an unnamed page is worse than a duplicated one
+        name_fallback=("Name",),
+        fluorophore=tuple(_FLUOROPHORE_TAGS) + ("Name", "Responsivity/Filter/Name"),
+    ),
+}
+
+#: Which dialect each channel-metadata locus speaks.
+_LOCUS_DIALECT: Dict[str, str] = {
+    LOCUS_SHARED_SCANBANDS: DIALECT_SCANBAND,
+    LOCUS_PER_PAGE_ROOT: DIALECT_PAGED,
+}
 
 
 def _text(element: Optional[ET.Element]) -> Optional[str]:
@@ -177,42 +227,119 @@ def _parse_scan_profile_json(image_info: ImageInfo, scan_profile_text: str) -> N
             image_info.scan_profile_name = name
 
 
-def _detect_format(
+def _page_root_carries_channel_tags(page_root: ET.Element) -> bool:
+    """True if this page's XML root describes a channel *in its own right*.
+
+    The discriminator is **where the tag sits**, not what it says. Classic
+    shared-XML layouts nest <Biomarker> inside <ScanBands-i>; paged layouts put
+    it (or a <Responsivity><Filter>) as a direct child of the page root. Testing
+    position is strictly more informative than the older test of whether the
+    page XML strings happened to differ, which said nothing when a scan's pages
+    were legitimately identical.
+    """
+    for tag in ("Biomarker", "BioMarker", "StainName", "Marker"):
+        if page_root.find(tag) is not None:
+            return True
+    return page_root.find("Responsivity/Filter") is not None
+
+
+class _StructureSignals(NamedTuple):
+    """Primitive structural facts about a QPTIFF
+
+    Both the channel-metadata locus (which drives parsing) and the legacy
+    ``acquisition_format`` label (kept only for back-compat) are pure functions
+    of these, so the two can never drift apart.
+    """
+
+    is_rgb: bool
+    scan_mode_is_brightfield: bool
+    has_scanbands: bool
+    n_scanbands: int
+    has_json_scanprofile: bool
+    n_pages: int
+    n_distinct_pages: int
+    pages_with_root_channel_tags: int
+
+    def to_dict(self) -> Dict[str, object]:
+        return dict(self._asdict())
+
+
+def _collect_signals(
     root: ET.Element,
     scan_mode: str,
     is_rgb: bool,
-) -> str:
-    """
-    Identify which QPTIFF format variant produced this file.. a couple of versions
-    as qptiff evolved from vectra
-
-    1. **brightfield** — scan_mode contains "Brightfield" (case-insensitive) or
-       the pixel data is RGB (``is_rgb``, i.e. samples stored in the S dimension).
-
-       NOTE: a ``<BFLampType>`` element is *not* sufficient on its own. Newer
-       Fusion 2.x fluorescence scans also emit ``<BFLampType>WhiteLED</BFLampType>``
-       alongside per-channel fluorescence pages, so keying off it misclassified
-       multiplex panels as 3-sample brightfield and dropped every channel's
-       biomarker / fluorophore metadata.
-    2. **polaris_scanband** — ``<ScanBands-i>`` elements are present anywhere in
-       the tree (older Vectra/Polaris/OPAL XML ScanProfile format).
-    3. **fusion_paged** — ``<ScanProfile>`` content is a JSON object (newer
-       Akoya Biosciences / Fusion 1.x format where channel metadata is
-       embedded per-page rather than in a shared ScanProfile).
-    4. **unknown** — no recognised structural signal; caller should attempt
-       strategies in sequence.
-    """
-    if "brightfield" in scan_mode.lower() or is_rgb:
-        return FORMAT_BRIGHTFIELD
-
-    if root.findall(".//ScanBands-i"):
-        return FORMAT_POLARIS_SCANBAND
-
+    per_page_xmls: Optional[List[str]],
+    page_roots: List[Optional[ET.Element]],
+) -> _StructureSignals:
+    """Gather every structural signal to check format of the xml fields"""
     sp = root.find("ScanProfile")
-    if sp is not None and sp.text and sp.text.strip().startswith("{"):
-        return FORMAT_FUSION_PAGED
+    sp_text = sp.text if sp is not None else None
+    scanbands = root.findall(".//ScanBands-i")
+    present = [x for x in (per_page_xmls or []) if x]
+    return _StructureSignals(
+        is_rgb=is_rgb,
+        scan_mode_is_brightfield="brightfield" in scan_mode.lower(),
+        has_scanbands=bool(scanbands),
+        n_scanbands=len(scanbands),
+        has_json_scanprofile=(
+            sp_text is not None and sp_text.strip().startswith("{")
+        ),
+        n_pages=len(present),
+        n_distinct_pages=len(set(present)),
+        pages_with_root_channel_tags=sum(
+            1 for r in page_roots if r is not None and _page_root_carries_channel_tags(r)
+        ),
+    )
 
+
+def _legacy_acquisition_format(sig: _StructureSignals) -> str:
+    """Reproduce the historical ``acquisition_format`` label exactly.
+
+    DEPRECATED as a dispatch key — see the FORMAT_* block in qptiff_types. This
+    exists only so files already converted to zarr keep reporting the same
+    string. The precedence here is verbatim the original ``_detect_format``.
+    """
+    if sig.scan_mode_is_brightfield or sig.is_rgb:
+        return FORMAT_BRIGHTFIELD
+    if sig.has_scanbands:
+        return FORMAT_POLARIS_SCANBAND
+    if sig.has_json_scanprofile:
+        return FORMAT_FUSION_PAGED
     return FORMAT_UNKNOWN
+
+
+def _determine_locus(sig: _StructureSignals) -> str:
+    """Decide where this file's per-channel metadata actually lives.
+
+    1. **RGB samples** — brightfield scan mode or RGB pixel data. There is no
+       per-channel metadata to locate.
+    2. **Per-page roots** — the pages describe themselves. When no <ScanBands-i>
+       exists this is unambiguous.
+    3. **Shared scanbands** — nothing at the page roots, but a <ScanBands-i>
+       block is there to read.
+
+    When *both* sources are present (newer "paged Polaris" files expose a
+    filter-cube <ScanBands-i> in the shared ScanProfile while describing each
+    stain at its page root) the page roots win unless the bands look like a
+    genuine one-per-channel list: identical page XMLs *and* exactly one band per
+    page. Those bands describe the filter cube rather than one stain each, so a
+    count mismatch is evidence against reading them as channels.
+    """
+    if sig.is_rgb or sig.scan_mode_is_brightfield:
+        return LOCUS_RGB_SAMPLES
+
+    if sig.pages_with_root_channel_tags:
+        if not sig.has_scanbands:
+            return LOCUS_PER_PAGE_ROOT
+        if sig.n_distinct_pages > 1 or sig.n_scanbands != sig.n_pages:
+            return LOCUS_PER_PAGE_ROOT
+        return LOCUS_SHARED_SCANBANDS
+
+    if sig.has_scanbands:
+        return LOCUS_SHARED_SCANBANDS
+    if sig.has_json_scanprofile and sig.n_pages:
+        return LOCUS_PER_PAGE_ROOT
+    return LOCUS_UNKNOWN
 
 
 def _select_active_band(
@@ -241,7 +368,7 @@ def _select_active_band(
 
 
 def _populate_channel_fields_from_element(
-    elem: ET.Element, fields: Dict[str, object]
+    elem: ET.Element, fields: Dict[str, object], dialect: str = DIALECT_SCANBAND
 ) -> None:
     """
     Pull every per-channel field we know how to extract out of a single XML
@@ -252,8 +379,12 @@ def _populate_channel_fields_from_element(
     Values are only set when they parse successfully, so defaults on the
     dataclass remain in effect when a field is missing from this file.
     """
-    # Biomarker / stain name
-    for tag in _BIOMARKER_TAGS:
+    tags = _DIALECTS.get(dialect, _DIALECTS[DIALECT_SCANBAND])
+
+    # Biomarker / stain name. The fallback tier only runs if the dedicated
+    # biomarker tags found nothing, so in the paged dialect a page carrying
+    # only <Name> still gets a name rather than "Channel_i".
+    for tag in tags.name + tags.name_fallback:
         el = elem.find(tag)
         if el is not None and el.text:
             val = el.text.strip()
@@ -261,11 +392,13 @@ def _populate_channel_fields_from_element(
                 fields["name"] = val
                 break
 
-    # fluorophore
-    for tag in _FLUOROPHORE_TAGS:
-        el = elem.find(tag)
-        if el is not None and el.text and el.text.strip():
-            fields["fluorophore"] = el.text.strip()
+    # Fluorophore. In the paged dialect this list reaches <Name> and the
+    # <Responsivity><Filter><Name> echo; in the scanband dialect it stops at
+    # the explicit <Fluorophore>/<Fluor>, leaving <Name> to mean the biomarker.
+    for tag in tags.fluorophore:
+        fluor = _text(elem.find(tag))
+        if fluor:
+            fields["fluorophore"] = fluor
             break
 
     # exposure time (us per spec)
@@ -438,7 +571,7 @@ def _parse_fluorescence_channels(
     channels: List[ChannelInfo] = []
     for idx, band in enumerate(root.findall(".//ScanBands-i")):
         fields: Dict[str, object] = {"index": idx, "name": f"Channel_{idx}"}
-        _populate_channel_fields_from_element(band, fields)
+        _populate_channel_fields_from_element(band, fields, DIALECT_SCANBAND)
 
         # Emission wavelength inference from fluorophore name is specific to
         # the OPAL scan-band format (e.g. "OPAL520" → 520 nm).
@@ -459,23 +592,41 @@ def _parse_fluorescence_channels(
     return channels
 
 
-def _parse_channels_from_per_page_xmls(per_page_xmls: List[str]) -> List[ChannelInfo]:
-    """
-    Extract per-channel info from individual page XMLs.
+def _parse_page_roots(
+    per_page_xmls: Optional[List[str]],
+) -> List[Optional[ET.Element]]:
+    """Parse each page's XML once, tolerating empty or malformed entries.
 
-    Newer PerkinElmer Fusion QPTIFF files embed per-channel metadata directly
+    Shared by locus detection and channel extraction so a 75-page panel is not
+    parsed twice.
+    """
+    roots: List[Optional[ET.Element]] = []
+    for xml in per_page_xmls or []:
+        if not xml:
+            roots.append(None)
+            continue
+        try:
+            roots.append(ET.fromstring(xml))
+        except ET.ParseError:
+            roots.append(None)
+    return roots
+
+
+def _parse_channels_from_page_roots(
+    page_roots: List[Optional[ET.Element]],
+) -> List[ChannelInfo]:
+    """
+    Extract per-channel info from individual page XML roots.
+
+    Fusion QPTIFF files (1.x and 2.x alike) embed per-channel metadata directly
     at the root level of each page's ImageDescription XML (one page per channel),
     rather than grouping them in ScanBands-i elements.
     """
     channels: List[ChannelInfo] = []
-    for idx, xml in enumerate(per_page_xmls):
+    for idx, page_root in enumerate(page_roots):
         fields: Dict[str, object] = {"index": idx, "name": f"Channel_{idx}"}
-        if xml:
-            try:
-                page_root = ET.fromstring(xml)
-                _populate_channel_fields_from_element(page_root, fields)
-            except ET.ParseError:
-                pass
+        if page_root is not None:
+            _populate_channel_fields_from_element(page_root, fields, DIALECT_PAGED)
         channels.append(ChannelInfo(**fields))  # type: ignore[arg-type]
     return channels
 
@@ -519,6 +670,7 @@ def parse_qpi_xml(
         return QptiffMetadata(
             slide=slide,
             images=[QptiffImageSceneMetadata(image_info=image_info, raw_xml=xml_string)],
+            channel_locus=LOCUS_UNKNOWN,
             raw_xml=xml_string,
         )
 
@@ -529,6 +681,7 @@ def parse_qpi_xml(
         return QptiffMetadata(
             slide=slide,
             images=[QptiffImageSceneMetadata(image_info=image_info, raw_xml=xml_string)],
+            channel_locus=LOCUS_UNKNOWN,
             raw_xml=xml_string,
         )
 
@@ -594,72 +747,67 @@ def parse_qpi_xml(
     image_info.camera = _parse_camera(root)
 
     exposure_times = _parse_exposure_times(root)
-    fmt = _detect_format(root, image_info.scan_mode or "", is_rgb)
-    log.debug("Detected QPTIFF format: %s (slide=%s)", fmt, slide.slide_id)
 
-    if fmt == FORMAT_BRIGHTFIELD:
+    page_roots = _parse_page_roots(per_page_xmls)
+    signals = _collect_signals(
+        root, image_info.scan_mode or "", is_rgb, per_page_xmls, page_roots
+    )
+    locus = _determine_locus(signals)
+    fmt = _legacy_acquisition_format(signals)
+    log.debug(
+        "QPTIFF channel locus: %s (legacy format=%s, slide=%s, signals=%s)",
+        locus,
+        fmt,
+        slide.slide_id,
+        signals.to_dict(),
+    )
+
+    def _generic_channels() -> List[ChannelInfo]:
+        if not (n_channels and n_channels > 0):
+            return []
+        return [
+            ChannelInfo(
+                index=i,
+                name=f"Channel_{i}",
+                exposure_time_us=(
+                    exposure_times[i] if i < len(exposure_times) else None
+                ),
+            )
+            for i in range(n_channels)
+        ]
+
+    if locus == LOCUS_RGB_SAMPLES:
         n = n_channels if n_channels and n_channels > 0 else 3
         channels = _parse_brightfield_channels(n, root)
 
-    elif fmt == FORMAT_POLARIS_SCANBAND:
-        # Newer "paged Polaris" files (Polaris/PhenoCycler, Fusion 2.x) carry the
-        # per-channel metadata — biomarker <Name>, <ExcitationFilter>/<EmissionFilter>,
-        # <Responsivity>, <ExposureTime>, <SignalUnits>, <Objective> — at each
-        # *page* XML root, like fusion_paged, while still exposing <ScanBands-i>
-        # filter-cube config in the shared ScanProfile. Detection lands on
-        # polaris_scanband because <ScanBands-i> is present, but the ScanBands-i
-        # describe the filter cube (not one stain each), so reading them yields
-        # unnamed channels and drops the filter/responsivity metadata.
-        #
-        # When the per-page XMLs are distinct, parse the page roots (rich
-        # per-channel data, handled by _populate_channel_fields_from_element).
-        # Fall back to the classic shared-XML ScanBands-i layout (old Vectra /
-        # Polaris OPAL, where every page repeats one root XML and the per-channel
-        # Biomarker/Fluorophore live inside ScanBands-i).
-        distinct_pages = {x for x in (per_page_xmls or []) if x}
-        if len(distinct_pages) > 1:
-            channels = _parse_channels_from_per_page_xmls(per_page_xmls)
-        else:
-            channels = _parse_fluorescence_channels(root, exposure_times)
+    elif locus == LOCUS_PER_PAGE_ROOT:
+        channels = _parse_channels_from_page_roots(page_roots) or _generic_channels()
 
-    elif fmt == FORMAT_FUSION_PAGED:
-        if per_page_xmls:
-            channels = _parse_channels_from_per_page_xmls(per_page_xmls)
-        elif n_channels and n_channels > 0:
-            channels = [
-                ChannelInfo(
-                    index=i,
-                    name=f"Channel_{i}",
-                    exposure_time_us=exposure_times[i] if i < len(exposure_times) else None,
-                )
-                for i in range(n_channels)
-            ]
+    elif locus == LOCUS_SHARED_SCANBANDS:
+        channels = _parse_fluorescence_channels(root, exposure_times)
 
-    else:  # FORMAT_UNKNOWN — try strategies in order
-        flu_channels = _parse_fluorescence_channels(root, exposure_times)
-        if flu_channels:
-            channels = flu_channels
-        elif per_page_xmls:
-            channels = _parse_channels_from_per_page_xmls(per_page_xmls)
-        elif n_channels and n_channels > 0:
-            channels = [
-                ChannelInfo(
-                    index=i,
-                    name=f"Channel_{i}",
-                    exposure_time_us=exposure_times[i] if i < len(exposure_times) else None,
-                )
-                for i in range(n_channels)
-            ]
+    else:  # LOCUS_UNKNOWN — fail open, try strategies in order
+        channels = (
+            _parse_fluorescence_channels(root, exposure_times)
+            or _parse_channels_from_page_roots(page_roots)
+            or _generic_channels()
+        )
 
     # supplement missing exposure times where possible
     for ch in channels:
         if ch.exposure_time_us is None and ch.index < len(exposure_times):
             ch.exposure_time_us = exposure_times[ch.index]
 
-    # Fusion paged: fluorophore lives in ScanProfile JSON, not per-page XML.
-    # experimentDescription.channels[] lists the filter cycle in order
-    # (e.g. ["DAPI", "ATTO550", "CY5", "AF750"]); channel i uses filter i % n.
-    if fmt == FORMAT_FUSION_PAGED and any(ch.fluorophore is None for ch in channels):
+    # Paged files: when the page XMLs carry no fluorophore at all, fall back to
+    # experimentDescription.channels[] in the ScanProfile JSON, which usually lists the
+    # filter set in acquisition order (e.g. ["DAPI", "ATTO550", "CY5", "AF750"]).
+    #
+    # This is only a positional guess, so it is applied strictly 1:1 and only when
+    # the counts match exactly. Multi-cycle scans do NOT repeat the filter list in
+    # order — a 75-page panel may run DAPI, ATTO550, AF750, Cy5, ATTO550, ... — so
+    # an `index % n` mapping silently invents wrong fluorophores. Leave None instead.
+    missing = [ch for ch in channels if ch.fluorophore is None]
+    if locus == LOCUS_PER_PAGE_ROOT and missing:
         sp_elem = root.find("ScanProfile")
         if sp_elem is not None and sp_elem.text and sp_elem.text.strip().startswith("{"):
             try:
@@ -669,11 +817,20 @@ def parse_qpi_xml(
                     c["name"] for c in exp.get("channels", [])
                     if isinstance(c, dict) and c.get("name")
                 ]
-                if filter_fluors:
-                    n = len(filter_fluors)
-                    for ch in channels:
-                        if ch.fluorophore is None:
-                            ch.fluorophore = filter_fluors[ch.index % n]
+                if filter_fluors and len(filter_fluors) == len(channels):
+                    for ch in missing:
+                        ch.fluorophore = filter_fluors[ch.index]
+                elif filter_fluors:
+                    log.warning(
+                        "QPTIFF %s: %d channel(s) have no fluorophore in their page "
+                        "XML and the ScanProfile filter list (%d entries) cannot be "
+                        "mapped 1:1 to %d channels; leaving fluorophore unset rather "
+                        "than guessing.",
+                        slide.slide_id,
+                        len(missing),
+                        len(filter_fluors),
+                        len(channels),
+                    )
             except (ValueError, TypeError, KeyError):
                 pass
 
@@ -686,6 +843,8 @@ def parse_qpi_xml(
         slide=slide,
         images=[image],
         acquisition_format=fmt,
+        channel_locus=locus,
+        structure_signature=signals.to_dict(),
         raw_xml=xml_string,
     )
 
